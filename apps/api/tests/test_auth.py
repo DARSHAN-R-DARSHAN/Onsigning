@@ -7,14 +7,15 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, insert, Enum
+from sqlalchemy.dialects.postgresql.asyncpg import dialect as asyncpg_dialect
 from sqlalchemy.exc import UnboundExecutionError
 
 from apps.api.core.auth import create_mock_jwt, get_tenant_context
 from apps.api.core.database import (
     User, Organization, OrganizationMembership, RiskPlaybook,
     Document, ExtractedClause, AuditRun, RiskAlert, AuditLog,
-    PortableUUID,
+    PortableUUID, DocHierarchyTypeEnum,
     set_user_context, set_tenant_context, async_session_factory,
     is_sqlite, _get_session_dialect_name, _is_sqlite_session
 )
@@ -934,3 +935,331 @@ def test_portable_uuid_pk_fk_mapping_consistency():
             assert isinstance(col.type, PortableUUID), (
                 f"Expected {model.__name__}.{col_name} to be PortableUUID, got {type(col.type)}"
             )
+
+
+# ==============================================================================
+# Task 5.12.35: Portable SQLAlchemy Enum Alignment Regression Tests
+# ==============================================================================
+
+def test_audit_actor_type_postgresql_compilation_and_binding():
+    """
+    Task 5.12.35 Regression:
+    Proves that compiling insert(AuditLog) with postgresql+asyncpg binds actor_type
+    with native cast $n::audit_actor_type, eliminating the SQLSTATE 42804 datatype mismatch.
+    """
+    stmt = insert(AuditLog).values(
+        id=str(uuid.uuid4()),
+        organization_id=str(uuid.uuid4()),
+        actor_user_id=None,
+        actor_type="SYSTEM_WORKER",
+        entity_table="documents",
+        entity_id=str(uuid.uuid4()),
+        action="BACKGROUND_AUDIT_COMPLETED"
+    )
+    compiled_pg = str(stmt.compile(dialect=asyncpg_dialect()))
+    assert "::audit_actor_type" in compiled_pg
+    assert "::VARCHAR" not in compiled_pg.split("actor_type")[0] if "actor_type" in compiled_pg else True
+
+    # Parameter check
+    params = stmt.compile(dialect=asyncpg_dialect()).params
+    assert params["actor_type"] == "SYSTEM_WORKER"
+
+
+@pytest.mark.asyncio
+async def test_audit_actor_type_sqlite_live_roundtrip_and_defaults(db_session: AsyncSession):
+    """
+    Task 5.12.35 Regression:
+    Proves that in an active SQLite session:
+    1. AuditLog accepts and retrieves explicit actor_type="SYSTEM_WORKER" as a string.
+    2. AuditLog defaults actor_type to "USER" when unspecified.
+    """
+    org_id = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
+    log1_id = str(uuid.uuid4())
+    log2_id = str(uuid.uuid4())
+
+    org = Organization(id=org_id, name="Enum Test Org", slug=f"enum-test-{uuid.uuid4().hex[:8]}")
+    db_session.add(org)
+    await db_session.commit()
+
+    # Log 1: Explicit SYSTEM_WORKER
+    log1 = AuditLog(
+        id=log1_id,
+        organization_id=org_id,
+        actor_user_id=None,
+        actor_type="SYSTEM_WORKER",
+        entity_table="documents",
+        entity_id=doc_id,
+        action="BACKGROUND_AUDIT_COMPLETED"
+    )
+    # Log 2: Default actor_type (USER)
+    log2 = AuditLog(
+        id=log2_id,
+        organization_id=org_id,
+        actor_user_id=None,
+        entity_table="documents",
+        entity_id=doc_id,
+        action="DOCUMENT_UPLOADED"
+    )
+    db_session.add_all([log1, log2])
+    await db_session.commit()
+
+    # Query and verify
+    queried1 = (await db_session.execute(select(AuditLog).where(AuditLog.id == log1_id))).scalar_one()
+    assert queried1.actor_type == "SYSTEM_WORKER"
+    assert isinstance(queried1.actor_type, str)
+
+    queried2 = (await db_session.execute(select(AuditLog).where(AuditLog.id == log2_id))).scalar_one()
+    assert queried2.actor_type == "USER"
+    assert isinstance(queried2.actor_type, str)
+
+
+def test_all_11_canonical_enums_definition_and_values():
+    """
+    Task 5.12.35 Regression:
+    Verifies that all 11 enum-backed columns declare SQLAlchemy Enum with create_type=False,
+    the exact canonical enum name, and exact values from 0001_mvp_schema.sql.
+    """
+    canonical_enums = {
+        (AuditLog, "actor_type"): (
+            "audit_actor_type",
+            ("USER", "SYSTEM_WORKER", "API_KEY"),
+            False,  # nullable
+            "USER"  # default
+        ),
+        (OrganizationMembership, "role"): (
+            "user_role",
+            ("OWNER", "ADMIN", "LEGAL_REVIEWER", "VIEWER"),
+            False,
+            "VIEWER"
+        ),
+        (Document, "hierarchy_type"): (
+            "doc_hierarchy_type",
+            ("MSA", "SOW", "AMENDMENT", "ADDENDUM_DPA", "SLA", "ORDER_FORM", "INSURANCE_COI", "OTHER"),
+            False,
+            "OTHER"
+        ),
+        (Document, "processing_status"): (
+            "doc_processing_status",
+            ("UPLOADED", "PARSING_LAYOUT", "EXTRACTING_FACTS", "EVALUATING_PLAYBOOK", "INDEXING_RETRIEVAL", "READY", "READY_WITH_WARNINGS", "FAILED"),
+            False,
+            "UPLOADED"
+        ),
+        (Document, "error_category"): (
+            "doc_error_category",
+            ("PARSER_ERROR", "UNREADABLE_SCANNED_PAGE", "CORRUPTED_FILE", "FILE_SIZE_EXCEEDED", "PAGE_COUNT_EXCEEDED", "TIMEOUT", "LLM_EXTRACTION_ERROR", "SCHEMA_VALIDATION_ERROR", "SYSTEM_ERROR"),
+            True,
+            None
+        ),
+        (ExtractedClause, "presence_status"): (
+            "clause_presence_status",
+            ("EXPLICITLY_STATED", "SILENT_OMISSION", "AMBIGUOUS_OR_CROSS_REF", "INSUFFICIENT_COVERAGE"),
+            False,
+            None
+        ),
+        (ExtractedClause, "citation_status"): (
+            "citation_verification_status",
+            ("EXACT_MATCH", "NORMALIZED_MATCH", "APPROXIMATE_NEEDS_REVIEW", "UNVERIFIED_MISMATCH", "NOT_APPLICABLE"),
+            False,
+            "NOT_APPLICABLE"
+        ),
+        (ExtractedClause, "cap_structure"): (
+            "liability_cap_structure",
+            ("FIXED_AMOUNT", "FEE_MULTIPLE", "GREATER_OF_FIXED_OR_MULTIPLE", "UNCAPPED", "SILENT", "AMBIGUOUS", "NOT_APPLICABLE"),
+            False,
+            "NOT_APPLICABLE"
+        ),
+        (ExtractedClause, "supersession_state"): (
+            "supersession_status",
+            ("NONE", "PROPOSED_BY_AI", "CONFIRMED_SUPERSEDED", "REJECTED_BY_HUMAN"),
+            False,
+            "NONE"
+        ),
+        (RiskAlert, "severity"): (
+            "risk_severity",
+            ("CRITICAL", "HIGH", "MEDIUM", "LOW", "COMPLIANT", "UNDECIDED_NEEDS_REVIEW"),
+            False,
+            None
+        ),
+        (RiskAlert, "review_status"): (
+            "review_status",
+            ("AI_EVALUATED", "NEEDS_HUMAN_REVIEW", "HUMAN_CONFIRMED", "HUMAN_OVERRIDDEN", "DISMISSED_FALSE_POSITIVE"),
+            False,
+            "AI_EVALUATED"
+        ),
+    }
+
+    for (model, col_name), (expected_name, expected_values, nullable, expected_default) in canonical_enums.items():
+        col = getattr(model, col_name)
+        assert isinstance(col.type, Enum), f"Expected {model.__name__}.{col_name} to be Enum, got {type(col.type)}"
+        assert col.type.name == expected_name, f"Expected enum name {expected_name}, got {col.type.name}"
+        assert col.type.native_enum is True, f"Expected native_enum=True on {model.__name__}.{col_name}"
+        assert set(col.type.enums) == set(expected_values), f"Enum values mismatch on {model.__name__}.{col_name}"
+        assert col.nullable is nullable, f"Nullability mismatch on {model.__name__}.{col_name}"
+        if expected_default is not None:
+            assert col.default.arg == expected_default, f"Default mismatch on {model.__name__}.{col_name}"
+
+
+def test_enum_postgresql_statement_compilation_all_11_columns():
+    """
+    Task 5.12.35 Regression:
+    Proves that compiling an insert statement for each of the 11 enum columns
+    under PostgreSQL asyncpg dialect emits the explicit cast ::<enum_name>.
+    """
+    test_cases = [
+        (AuditLog, "actor_type", "SYSTEM_WORKER", "audit_actor_type"),
+        (OrganizationMembership, "role", "ADMIN", "user_role"),
+        (Document, "hierarchy_type", "MSA", "doc_hierarchy_type"),
+        (Document, "processing_status", "UPLOADED", "doc_processing_status"),
+        (Document, "error_category", "TIMEOUT", "doc_error_category"),
+        (ExtractedClause, "presence_status", "EXPLICITLY_STATED", "clause_presence_status"),
+        (ExtractedClause, "citation_status", "EXACT_MATCH", "citation_verification_status"),
+        (ExtractedClause, "cap_structure", "FIXED_AMOUNT", "liability_cap_structure"),
+        (ExtractedClause, "supersession_state", "NONE", "supersession_status"),
+        (RiskAlert, "severity", "CRITICAL", "risk_severity"),
+        (RiskAlert, "review_status", "AI_EVALUATED", "review_status"),
+    ]
+
+    for model, col_name, sample_val, enum_name in test_cases:
+        stmt = insert(model).values({col_name: sample_val})
+        compiled_sql = str(stmt.compile(dialect=asyncpg_dialect()))
+        expected_token = f"::{enum_name}"
+        assert expected_token in compiled_sql, f"Expected {expected_token} in {compiled_sql} for {model.__name__}.{col_name}"
+
+
+@pytest.mark.asyncio
+async def test_enum_sqlite_nullability_and_roundtrip(db_session: AsyncSession):
+    """
+    Task 5.12.35 Regression:
+    Proves that in an active SQLite session:
+    1. Nullable enum fields (Document.error_category) accept None and can be updated to valid enum strings.
+    2. Multiple enum columns on Document and ExtractedClause insert and read back as strings cleanly.
+    """
+    org_id = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
+    clause_id = str(uuid.uuid4())
+
+    org = Organization(id=org_id, name="Enum Test Org 2", slug=f"enum-test-2-{uuid.uuid4().hex[:8]}")
+    db_session.add(org)
+    await db_session.commit()
+
+    # Document with null error_category and default processing_status/hierarchy_type
+    doc = Document(
+        id=doc_id,
+        organization_id=org_id,
+        title="Enum Doc",
+        original_filename="doc.pdf",
+        storage_key="keys/doc.pdf",
+        sha256=f"sha_{uuid.uuid4().hex}",
+        mime_type="application/pdf",
+        byte_size=2048,
+        error_category=None
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    queried_doc = (await db_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
+    assert queried_doc.error_category is None
+    assert queried_doc.hierarchy_type == "OTHER"
+    assert queried_doc.processing_status == "UPLOADED"
+
+    # Update nullable error_category
+    queried_doc.error_category = "TIMEOUT"
+    queried_doc.processing_status = "FAILED"
+    await db_session.commit()
+
+    db_session.expire_all()
+    reloaded_doc = (await db_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
+    assert reloaded_doc.error_category == "TIMEOUT"
+    assert reloaded_doc.processing_status == "FAILED"
+
+    # ExtractedClause with all 4 enum columns
+    clause = ExtractedClause(
+        id=clause_id,
+        organization_id=org_id,
+        document_id=doc_id,
+        clause_category="TERMINATION",
+        presence_status="EXPLICITLY_STATED",
+        citation_status="EXACT_MATCH",
+        cap_structure="FIXED_AMOUNT",
+        supersession_state="NONE",
+        factual_summary="30-day notice requirement"
+    )
+    db_session.add(clause)
+    await db_session.commit()
+
+    db_session.expire_all()
+    queried_clause = (await db_session.execute(select(ExtractedClause).where(ExtractedClause.id == clause_id))).scalar_one()
+    assert queried_clause.presence_status == "EXPLICITLY_STATED"
+    assert isinstance(queried_clause.presence_status, str)
+    assert queried_clause.citation_status == "EXACT_MATCH"
+    assert isinstance(queried_clause.citation_status, str)
+    assert queried_clause.cap_structure == "FIXED_AMOUNT"
+    assert isinstance(queried_clause.cap_structure, str)
+    assert queried_clause.supersession_state == "NONE"
+    assert isinstance(queried_clause.supersession_state, str)
+
+
+@pytest.mark.asyncio
+async def test_doc_hierarchy_type_alias_coercion_and_validation(db_session: AsyncSession):
+    """
+    Task 5.12.35 Regression:
+    Proves that DocHierarchyTypeEnum:
+    1. Transparently coerces legacy UI/payload aliases:
+       - 'MASTER_SERVICES_AGREEMENT' -> 'MSA'
+       - 'STATEMENT_OF_WORK' -> 'SOW'
+    2. Preserves standard canonical enum values ('MSA', 'AMENDMENT', etc.).
+    3. Rejects invalid enum values during object lookup with LookupError.
+    4. Persists coerced values accurately in an active database session.
+    """
+    org_id = str(uuid.uuid4())
+    doc_id_1 = str(uuid.uuid4())
+    doc_id_2 = str(uuid.uuid4())
+
+    org = Organization(id=org_id, name="Hierarchy Test Org", slug=f"hierarchy-test-{uuid.uuid4().hex[:8]}")
+    db_session.add(org)
+    await db_session.commit()
+
+    # 1. Test unit-level processor coercion
+    bp = DocHierarchyTypeEnum.bind_processor(None)
+    assert bp("MASTER_SERVICES_AGREEMENT") == "MSA"
+    assert bp("STATEMENT_OF_WORK") == "SOW"
+    assert bp("MSA") == "MSA"
+    assert bp("OTHER") == "OTHER"
+
+    # 2. Test invalid value lookup rejection
+    with pytest.raises(LookupError, match="not among the defined enum values"):
+        DocHierarchyTypeEnum._object_value_for_elem("INVALID_CONTRACT_TYPE")
+
+    # 3. Test active DB session round-trip with alias input
+    doc1 = Document(
+        id=doc_id_1,
+        organization_id=org_id,
+        title="MSA Doc",
+        original_filename="msa.pdf",
+        storage_key="keys/msa.pdf",
+        sha256=f"sha_{uuid.uuid4().hex}",
+        mime_type="application/pdf",
+        byte_size=1024,
+        hierarchy_type="MASTER_SERVICES_AGREEMENT"
+    )
+    doc2 = Document(
+        id=doc_id_2,
+        organization_id=org_id,
+        title="SOW Doc",
+        original_filename="sow.pdf",
+        storage_key="keys/sow.pdf",
+        sha256=f"sha_{uuid.uuid4().hex}",
+        mime_type="application/pdf",
+        byte_size=1024,
+        hierarchy_type="STATEMENT_OF_WORK"
+    )
+    db_session.add_all([doc1, doc2])
+    await db_session.commit()
+
+    db_session.expire_all()
+    loaded_1 = (await db_session.execute(select(Document).where(Document.id == doc_id_1))).scalar_one()
+    loaded_2 = (await db_session.execute(select(Document).where(Document.id == doc_id_2))).scalar_one()
+
+    assert loaded_1.hierarchy_type == "MSA"
+    assert loaded_2.hierarchy_type == "SOW"

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     Column, String, Integer, BigInteger, Boolean, DateTime, Date,
     Text, ForeignKey, Index, UniqueConstraint, text, Numeric,
-    TypeDecorator, JSON, event
+    TypeDecorator, JSON, event, Enum
 )
 from sqlalchemy.exc import UnboundExecutionError
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB, ARRAY
@@ -327,6 +327,125 @@ async def set_tenant_context(
         session.info["last_applied_user_id"] = uid_str
 
 
+# --- Canonical PostgreSQL Enum Types (Strictly Conforming to 0001_mvp_schema.sql) ---
+
+class AliasedDocHierarchyTypeEnum(Enum):
+    """
+    Subclass of SQLAlchemy Enum for doc_hierarchy_type that transparently coerces
+    legacy application/UI aliases ('MASTER_SERVICES_AGREEMENT' -> 'MSA', 'STATEMENT_OF_WORK' -> 'SOW')
+    to preserve backward compatibility with existing tests and UI payloads while
+    compiling natively to the PostgreSQL 'doc_hierarchy_type' enum.
+    """
+    ALIASES = {
+        "MASTER_SERVICES_AGREEMENT": "MSA",
+        "STATEMENT_OF_WORK": "SOW",
+    }
+
+    def bind_processor(self, dialect):
+        parent_proc = super().bind_processor(dialect)
+
+        def process(value):
+            if value is not None and isinstance(value, str):
+                value = self.ALIASES.get(value, value)
+            if parent_proc:
+                return parent_proc(value)
+            return value
+
+        return process
+
+    def result_processor(self, dialect, coltype):
+        parent_proc = super().result_processor(dialect, coltype)
+
+        def process(value):
+            if value is not None and isinstance(value, str):
+                value = self.ALIASES.get(value, value)
+            if parent_proc:
+                return parent_proc(value)
+            return value
+
+        return process
+
+
+UserRoleEnum = Enum(
+    "OWNER", "ADMIN", "LEGAL_REVIEWER", "VIEWER",
+    name="user_role",
+    create_type=False,
+    length=50
+)
+
+DocHierarchyTypeEnum = AliasedDocHierarchyTypeEnum(
+    "MSA", "SOW", "AMENDMENT", "ADDENDUM_DPA", "SLA", "ORDER_FORM", "INSURANCE_COI", "OTHER",
+    name="doc_hierarchy_type",
+    create_type=False,
+    length=50
+)
+
+DocProcessingStatusEnum = Enum(
+    "UPLOADED", "PARSING_LAYOUT", "EXTRACTING_FACTS", "EVALUATING_PLAYBOOK", "INDEXING_RETRIEVAL",
+    "READY", "READY_WITH_WARNINGS", "FAILED",
+    name="doc_processing_status",
+    create_type=False,
+    length=50
+)
+
+DocErrorCategoryEnum = Enum(
+    "PARSER_ERROR", "UNREADABLE_SCANNED_PAGE", "CORRUPTED_FILE", "FILE_SIZE_EXCEEDED",
+    "PAGE_COUNT_EXCEEDED", "TIMEOUT", "LLM_EXTRACTION_ERROR", "SCHEMA_VALIDATION_ERROR", "SYSTEM_ERROR",
+    name="doc_error_category",
+    create_type=False,
+    length=50
+)
+
+ClausePresenceStatusEnum = Enum(
+    "EXPLICITLY_STATED", "SILENT_OMISSION", "AMBIGUOUS_OR_CROSS_REF", "INSUFFICIENT_COVERAGE",
+    name="clause_presence_status",
+    create_type=False,
+    length=50
+)
+
+CitationVerificationStatusEnum = Enum(
+    "EXACT_MATCH", "NORMALIZED_MATCH", "APPROXIMATE_NEEDS_REVIEW", "UNVERIFIED_MISMATCH", "NOT_APPLICABLE",
+    name="citation_verification_status",
+    create_type=False,
+    length=50
+)
+
+LiabilityCapStructureEnum = Enum(
+    "FIXED_AMOUNT", "FEE_MULTIPLE", "GREATER_OF_FIXED_OR_MULTIPLE", "UNCAPPED", "SILENT", "AMBIGUOUS", "NOT_APPLICABLE",
+    name="liability_cap_structure",
+    create_type=False,
+    length=50
+)
+
+SupersessionStatusEnum = Enum(
+    "NONE", "PROPOSED_BY_AI", "CONFIRMED_SUPERSEDED", "REJECTED_BY_HUMAN",
+    name="supersession_status",
+    create_type=False,
+    length=50
+)
+
+RiskSeverityEnum = Enum(
+    "CRITICAL", "HIGH", "MEDIUM", "LOW", "COMPLIANT", "UNDECIDED_NEEDS_REVIEW",
+    name="risk_severity",
+    create_type=False,
+    length=50
+)
+
+ReviewStatusEnum = Enum(
+    "AI_EVALUATED", "NEEDS_HUMAN_REVIEW", "HUMAN_CONFIRMED", "HUMAN_OVERRIDDEN", "DISMISSED_FALSE_POSITIVE",
+    name="review_status",
+    create_type=False,
+    length=50
+)
+
+AuditActorTypeEnum = Enum(
+    "USER", "SYSTEM_WORKER", "API_KEY",
+    name="audit_actor_type",
+    create_type=False,
+    length=50
+)
+
+
 # --- ORM Entity Definitions (Strictly Conforming to SCHEMA.md) ---
 
 class User(Base):
@@ -360,7 +479,7 @@ class OrganizationMembership(Base):
     id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(PortableUUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    role = Column(String(50), nullable=False, default="VIEWER")  # OWNER, ADMIN, LEGAL_REVIEWER, VIEWER
+    role = Column(UserRoleEnum, nullable=False, default="VIEWER")  # OWNER, ADMIN, LEGAL_REVIEWER, VIEWER
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
     __table_args__ = (
@@ -405,12 +524,12 @@ class Document(Base):
     sha256 = Column(String(64), nullable=False, index=True)
     mime_type = Column(String(100), nullable=False)
     byte_size = Column(BigInteger, nullable=False)
-    hierarchy_type = Column(String(50), nullable=False, default="OTHER")
-    processing_status = Column(String(50), nullable=False, default="UPLOADED")  # doc_processing_status
+    hierarchy_type = Column(DocHierarchyTypeEnum, nullable=False, default="OTHER")
+    processing_status = Column(DocProcessingStatusEnum, nullable=False, default="UPLOADED")  # doc_processing_status
     page_count = Column(Integer, nullable=True)
     unreadable_pages = Column(PortableIntArray, nullable=True, default=list)  # INT[] in PostgreSQL, JSON list in SQLite
     parser_warnings = Column(Text, nullable=True, default="[]")   # JSON list of warnings
-    error_category = Column(String(50), nullable=True)            # doc_error_category
+    error_category = Column(DocErrorCategoryEnum, nullable=True)            # doc_error_category
     error_message = Column(Text, nullable=True)
     error_detail = Column(Text, nullable=True)                    # JSON diagnostics
     failed_at = Column(DateTime(timezone=True), nullable=True)
@@ -437,15 +556,15 @@ class ExtractedClause(Base):
     contract_family_id = Column(PortableUUID, nullable=True)
     document_id = Column(PortableUUID, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     clause_category = Column(String(100), nullable=False)
-    presence_status = Column(String(50), nullable=False)  # clause_presence_status
+    presence_status = Column(ClausePresenceStatusEnum, nullable=False)  # clause_presence_status
     section_reference = Column(String(100), nullable=True)
     page_number = Column(Integer, nullable=True)
     page_end = Column(Integer, nullable=True)
     verbatim_quote = Column(Text, nullable=True)
-    citation_status = Column(String(50), nullable=False, default="NOT_APPLICABLE")
+    citation_status = Column(CitationVerificationStatusEnum, nullable=False, default="NOT_APPLICABLE")
     is_evidence_verified = Column(Boolean, nullable=False, default=False)
     factual_summary = Column(Text, nullable=False)
-    cap_structure = Column(String(50), nullable=False, default="NOT_APPLICABLE")
+    cap_structure = Column(LiabilityCapStructureEnum, nullable=False, default="NOT_APPLICABLE")
     cap_fixed_amount_cents = Column(BigInteger, nullable=True)
     cap_currency = Column(String(3), nullable=True)
     cap_fee_multiple = Column(Numeric(6, 2), nullable=True)
@@ -453,7 +572,7 @@ class ExtractedClause(Base):
     governing_law_jurisdiction = Column(String(100), nullable=True)
     notice_period_days = Column(Integer, nullable=True)
     extraction_uncertainty_notes = Column(Text, nullable=True)
-    supersession_state = Column(String(50), nullable=False, default="NONE")
+    supersession_state = Column(SupersessionStatusEnum, nullable=False, default="NONE")
     overrides_section_reference = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -492,12 +611,12 @@ class RiskAlert(Base):
     organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
     audit_run_id = Column(PortableUUID, ForeignKey("audit_runs.id", ondelete="CASCADE"), nullable=False)
     extracted_clause_id = Column(PortableUUID, ForeignKey("extracted_clauses.id", ondelete="SET NULL"), nullable=True)
-    severity = Column(String(50), nullable=False)  # risk_severity
+    severity = Column(RiskSeverityEnum, nullable=False)  # risk_severity
     rule_id = Column(String(64), nullable=False)
     title = Column(String(255), nullable=False)
     explanation = Column(Text, nullable=False)
     evidence_payload = Column(Text, nullable=False)  # JSON snapshot of evidence
-    review_status = Column(String(50), nullable=False, default="AI_EVALUATED")  # review_status
+    review_status = Column(ReviewStatusEnum, nullable=False, default="AI_EVALUATED")  # review_status
     reviewed_by = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     reviewed_at = Column(DateTime(timezone=True), nullable=True)
     review_note = Column(Text, nullable=True)
@@ -517,7 +636,7 @@ class AuditLog(Base):
     id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
     actor_user_id = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    actor_type = Column(String(50), nullable=False, default="USER")
+    actor_type = Column(AuditActorTypeEnum, nullable=False, default="USER")
     entity_table = Column(String(100), nullable=False)
     entity_id = Column(PortableUUID, nullable=False)
     action = Column(String(50), nullable=False)
