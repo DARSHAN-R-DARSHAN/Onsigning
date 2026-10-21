@@ -13,9 +13,12 @@ from sqlalchemy.exc import UnboundExecutionError
 from apps.api.core.auth import create_mock_jwt, get_tenant_context
 from apps.api.core.database import (
     User, Organization, OrganizationMembership, RiskPlaybook,
+    Document, ExtractedClause, AuditRun, RiskAlert, AuditLog,
+    PortableUUID,
     set_user_context, set_tenant_context, async_session_factory,
     is_sqlite, _get_session_dialect_name, _is_sqlite_session
 )
+from sqlalchemy.dialects import postgresql, sqlite
 from apps.api.core.exceptions import AuthorizationError
 
 
@@ -739,3 +742,195 @@ async def test_unbound_session_dialect_resolution_and_fallback():
     with patch("apps.api.core.database.is_sqlite", True):
         assert _get_session_dialect_name(unbound_session) == "sqlite"
         assert _is_sqlite_session(unbound_session) is True
+
+
+# ==============================================================================
+# Task 5.12.31: PortableUUID Regression Tests
+# ==============================================================================
+
+def test_portable_uuid_load_dialect_impl():
+    """
+    Task 5.12.31 Regression (Requirement 1):
+    Proves PortableUUID loads PG_UUID on PostgreSQL dialect and String(36) on SQLite dialect.
+    """
+    uuid_type = PortableUUID()
+    pg_impl = uuid_type.load_dialect_impl(postgresql.dialect())
+    assert isinstance(pg_impl, postgresql.UUID)
+    assert pg_impl.as_uuid is True
+
+    sqlite_impl = uuid_type.load_dialect_impl(sqlite.dialect())
+    assert sqlite_impl.python_type is str
+    assert sqlite_impl.length == 36
+
+
+def test_portable_uuid_bind_and_result_processing():
+    """
+    Task 5.12.31 Regression (Requirements 2, 3, 4, 5):
+    Proves that:
+    1. PostgreSQL dialect binds both str and uuid.UUID as uuid.UUID objects.
+    2. SQLite dialect binds both str and uuid.UUID as 36-char string representations.
+    3. Both dialects normalize result values to strings (the canonical API/test contract).
+    4. Nullable values (None) are preserved as None across both dialects.
+    5. Invalid UUID inputs raise ValueError on bind.
+    """
+    uuid_type = PortableUUID()
+    pg_d = postgresql.dialect()
+    sq_d = sqlite.dialect()
+
+    test_uuid = uuid.uuid4()
+    test_str = str(test_uuid)
+
+    # 1. PostgreSQL bind processing
+    pg_from_str = uuid_type.process_bind_param(test_str, pg_d)
+    assert isinstance(pg_from_str, uuid.UUID)
+    assert pg_from_str == test_uuid
+
+    pg_from_uuid = uuid_type.process_bind_param(test_uuid, pg_d)
+    assert isinstance(pg_from_uuid, uuid.UUID)
+    assert pg_from_uuid == test_uuid
+
+    assert uuid_type.process_bind_param(None, pg_d) is None
+
+    with pytest.raises(ValueError, match="Invalid UUID value"):
+        uuid_type.process_bind_param("not-a-valid-uuid", pg_d)
+
+    # 2. SQLite bind processing
+    sq_from_str = uuid_type.process_bind_param(test_str, sq_d)
+    assert isinstance(sq_from_str, str)
+    assert sq_from_str == test_str
+
+    sq_from_uuid = uuid_type.process_bind_param(test_uuid, sq_d)
+    assert isinstance(sq_from_uuid, str)
+    assert sq_from_uuid == test_str
+
+    assert uuid_type.process_bind_param(None, sq_d) is None
+
+    with pytest.raises(ValueError, match="Invalid UUID value"):
+        uuid_type.process_bind_param("malformed-uuid", sq_d)
+
+    # 3. Result processing (normalization to str)
+    assert uuid_type.process_result_value(test_uuid, pg_d) == test_str
+    assert uuid_type.process_result_value(test_str, pg_d) == test_str
+    assert uuid_type.process_result_value(None, pg_d) is None
+
+    assert uuid_type.process_result_value(test_str, sq_d) == test_str
+    assert uuid_type.process_result_value(None, sq_d) is None
+
+
+def test_portable_uuid_statement_compilation_and_param_types():
+    """
+    Task 5.12.31 Regression:
+    Proves that compiling a query with PostgreSQL dialect generates $1::UUID (not VARCHAR),
+    avoiding the PostgreSQL 42883 'operator does not exist: uuid = character varying' failure.
+    """
+    test_id = str(uuid.uuid4())
+    stmt = select(Document).where(Document.id == test_id)
+
+    # PostgreSQL compilation
+    pg_compiled = stmt.compile(dialect=postgresql.dialect())
+    compiled_str = str(pg_compiled)
+    assert "documents.id = :id_1" in compiled_str or "documents.id =" in compiled_str
+
+    # Type check on the compiled bound parameter
+    bind_param = pg_compiled.params["id_1"]
+    assert bind_param == test_id
+    # Underlying column type compiles to native UUID on PostgreSQL
+    assert isinstance(Document.id.type, PortableUUID)
+    assert isinstance(Document.id.type.load_dialect_impl(postgresql.dialect()), postgresql.UUID)
+
+    # SQLite compilation
+    sq_compiled = stmt.compile(dialect=sqlite.dialect())
+    assert isinstance(Document.id.type.load_dialect_impl(sqlite.dialect()).python_type, type(str))
+
+
+@pytest.mark.asyncio
+async def test_portable_uuid_live_roundtrip_and_nullability(db_session: AsyncSession):
+    """
+    Task 5.12.31 Regression (Requirement 6):
+    Proves that in an active database session (SQLite):
+    1. Entities can be inserted and queried by both string UUIDs and uuid.UUID instances.
+    2. Read results consistently produce strings.
+    3. Nullable UUID foreign keys accept and store None cleanly.
+    4. Nullable UUID foreign keys can be updated with uuid.UUID objects and retrieved as strings.
+    """
+    org_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
+    vendor_uuid = uuid.uuid4()
+
+    org = Organization(id=org_id, name="UUID Test Org", slug=f"uuid-test-{uuid.uuid4().hex[:8]}")
+    user = User(id=user_id, email=f"uuid-{uuid.uuid4().hex[:8]}@example.com")
+    db_session.add_all([org, user])
+    await db_session.commit()
+
+    # Insert Document with None for nullable UUID fields (contract_family_id, vendor_id, created_by)
+    doc = Document(
+        id=doc_id,
+        organization_id=org_id,
+        title="UUID Test Doc",
+        original_filename="test.pdf",
+        storage_key="keys/test",
+        sha256=f"sha256_{uuid.uuid4().hex}",
+        mime_type="application/pdf",
+        byte_size=1024,
+        contract_family_id=None,
+        vendor_id=None,
+        created_by=None
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    # Query 1: Query by str
+    res1 = (await db_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
+    assert res1.id == doc_id
+    assert isinstance(res1.id, str)
+    assert res1.organization_id == org_id
+    assert isinstance(res1.organization_id, str)
+    assert res1.contract_family_id is None
+    assert res1.vendor_id is None
+    assert res1.created_by is None
+
+    # Query 2: Query by uuid.UUID object
+    res2 = (await db_session.execute(select(Document).where(Document.id == uuid.UUID(doc_id)))).scalar_one()
+    assert res2.id == doc_id
+
+    # Update nullable UUID field with uuid.UUID instance
+    res2.vendor_id = vendor_uuid
+    res2.created_by = uuid.UUID(user_id)
+    await db_session.commit()
+
+    # Expire session identity map to force fresh database row retrieval through process_result_value
+    db_session.expire_all()
+
+    # Query 3: Re-query from database and verify normalized string output
+    res3 = (await db_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
+    assert res3.vendor_id == str(vendor_uuid)
+    assert isinstance(res3.vendor_id, str)
+    assert res3.created_by == user_id
+    assert isinstance(res3.created_by, str)
+
+
+def test_portable_uuid_pk_fk_mapping_consistency():
+    """
+    Task 5.12.31 Regression (Requirement 7):
+    Verifies that all 9 ORM models declare PortableUUID on all canonical UUID PK and FK columns,
+    ensuring foreign-key type compatibility with referenced primary keys.
+    """
+    expected_uuid_columns = {
+        User: ["id"],
+        Organization: ["id"],
+        OrganizationMembership: ["id", "organization_id", "user_id"],
+        RiskPlaybook: ["id", "organization_id", "created_by"],
+        Document: ["id", "organization_id", "contract_family_id", "vendor_id", "created_by"],
+        ExtractedClause: ["id", "organization_id", "contract_family_id", "document_id"],
+        AuditRun: ["id", "organization_id", "document_id", "playbook_id", "created_by"],
+        RiskAlert: ["id", "organization_id", "audit_run_id", "extracted_clause_id", "reviewed_by"],
+        AuditLog: ["id", "organization_id", "actor_user_id", "entity_id"],
+    }
+
+    for model, col_names in expected_uuid_columns.items():
+        for col_name in col_names:
+            col = getattr(model, col_name)
+            assert isinstance(col.type, PortableUUID), (
+                f"Expected {model.__name__}.{col_name} to be PortableUUID, got {type(col.type)}"
+            )

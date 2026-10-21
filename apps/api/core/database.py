@@ -124,6 +124,38 @@ class PortableStringArray(TypeDecorator):
         return list(value)
 
 
+class PortableUUID(TypeDecorator):
+    """
+    Portable UUID Type.
+    Emits native PostgreSQL UUID, and VARCHAR(36) on SQLite.
+    Accepts both str and uuid.UUID on bind; always yields str on read.
+    """
+    impl = String(36)
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(PG_UUID(as_uuid=True))
+        return dialect.type_descriptor(String(36))
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if not isinstance(value, uuid.UUID):
+            try:
+                value = uuid.UUID(str(value))
+            except (ValueError, TypeError, AttributeError) as e:
+                raise ValueError(f"Invalid UUID value: {value}") from e
+        if dialect.name == "postgresql":
+            return value
+        return str(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return str(value)
+
+
 @event.listens_for(Session, "after_begin")
 def _reapply_tenant_context_on_transaction_begin(session: Session, transaction, connection):
     """
@@ -299,7 +331,7 @@ async def set_tenant_context(
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), unique=True, nullable=False, index=True)
     full_name = Column(String(255), nullable=True)
     external_auth_id = Column(String(255), unique=True, nullable=True)
@@ -311,7 +343,7 @@ class User(Base):
 
 class Organization(Base):
     __tablename__ = "organizations"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String(255), nullable=False)
     slug = Column(String(100), unique=True, nullable=False, index=True)
     default_currency = Column(String(3), nullable=False, default="USD")
@@ -325,9 +357,9 @@ class Organization(Base):
 
 class OrganizationMembership(Base):
     __tablename__ = "organization_memberships"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    organization_id = Column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
-    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(PortableUUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     role = Column(String(50), nullable=False, default="VIEWER")  # OWNER, ADMIN, LEGAL_REVIEWER, VIEWER
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -342,14 +374,14 @@ class OrganizationMembership(Base):
 
 class RiskPlaybook(Base):
     __tablename__ = "risk_playbooks"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    organization_id = Column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
     name = Column(String(255), nullable=False)
     version = Column(Integer, nullable=False, default=1)
     description = Column(Text, nullable=True)
     rules = Column(Text, nullable=False)  # Stored as JSON string
     is_active = Column(Boolean, nullable=False, default=True)
-    created_by = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_by = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -363,10 +395,10 @@ class RiskPlaybook(Base):
 
 class Document(Base):
     __tablename__ = "documents"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    organization_id = Column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
-    contract_family_id = Column(String(36), nullable=True)
-    vendor_id = Column(String(36), nullable=True)
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    contract_family_id = Column(PortableUUID, nullable=True)
+    vendor_id = Column(PortableUUID, nullable=True)
     title = Column(String(255), nullable=False)
     original_filename = Column(String(255), nullable=False)
     storage_key = Column(String(512), nullable=False)
@@ -385,7 +417,7 @@ class Document(Base):
     effective_date = Column(Date, nullable=True)
     expiration_date = Column(Date, nullable=True)
     renewal_date = Column(Date, nullable=True)
-    created_by = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_by = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -400,10 +432,10 @@ class Document(Base):
 
 class ExtractedClause(Base):
     __tablename__ = "extracted_clauses"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    organization_id = Column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
-    contract_family_id = Column(String(36), nullable=True)
-    document_id = Column(String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    contract_family_id = Column(PortableUUID, nullable=True)
+    document_id = Column(PortableUUID, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     clause_category = Column(String(100), nullable=False)
     presence_status = Column(String(50), nullable=False)  # clause_presence_status
     section_reference = Column(String(100), nullable=True)
@@ -435,16 +467,16 @@ class ExtractedClause(Base):
 
 class AuditRun(Base):
     __tablename__ = "audit_runs"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    organization_id = Column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
-    document_id = Column(String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
-    playbook_id = Column(String(36), ForeignKey("risk_playbooks.id", ondelete="RESTRICT"), nullable=False)
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    document_id = Column(PortableUUID, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    playbook_id = Column(PortableUUID, ForeignKey("risk_playbooks.id", ondelete="RESTRICT"), nullable=False)
     playbook_version = Column(Integer, nullable=False)
     status = Column(String(50), nullable=False, default="COMPLETED")
     started_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     summary = Column(Text, nullable=False, default="{}")  # JSON summary
-    created_by = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_by = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     __table_args__ = (
         Index("idx_audit_runs_tenant_doc", "organization_id", "document_id", "started_at"),
@@ -456,17 +488,17 @@ class AuditRun(Base):
 
 class RiskAlert(Base):
     __tablename__ = "risk_alerts"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    organization_id = Column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
-    audit_run_id = Column(String(36), ForeignKey("audit_runs.id", ondelete="CASCADE"), nullable=False)
-    extracted_clause_id = Column(String(36), ForeignKey("extracted_clauses.id", ondelete="SET NULL"), nullable=True)
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    audit_run_id = Column(PortableUUID, ForeignKey("audit_runs.id", ondelete="CASCADE"), nullable=False)
+    extracted_clause_id = Column(PortableUUID, ForeignKey("extracted_clauses.id", ondelete="SET NULL"), nullable=True)
     severity = Column(String(50), nullable=False)  # risk_severity
     rule_id = Column(String(64), nullable=False)
     title = Column(String(255), nullable=False)
     explanation = Column(Text, nullable=False)
     evidence_payload = Column(Text, nullable=False)  # JSON snapshot of evidence
     review_status = Column(String(50), nullable=False, default="AI_EVALUATED")  # review_status
-    reviewed_by = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    reviewed_by = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     reviewed_at = Column(DateTime(timezone=True), nullable=True)
     review_note = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -482,12 +514,12 @@ class RiskAlert(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    organization_id = Column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
-    actor_user_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    id = Column(PortableUUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id = Column(PortableUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    actor_user_id = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     actor_type = Column(String(50), nullable=False, default="USER")
     entity_table = Column(String(100), nullable=False)
-    entity_id = Column(String(36), nullable=False)
+    entity_id = Column(PortableUUID, nullable=False)
     action = Column(String(50), nullable=False)
     previous_state = Column(Text, nullable=True)
     new_state = Column(Text, nullable=True)

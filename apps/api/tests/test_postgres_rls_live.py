@@ -516,7 +516,7 @@ class TestSQLAlchemyTenantContextLive:
         # Tx 2 on same session: after_begin listener should have re-applied GUC
         docs_after_commit = (await pg_db_session.execute(stmt)).scalars().all()
         assert len(docs_after_commit) == 1
-        assert docs_after_commit[0].id == data["doc_a_id"]
+        assert str(docs_after_commit[0].id) == data["doc_a_id"]
 
         # Rollback Tx 2
         await pg_db_session.rollback()
@@ -524,7 +524,7 @@ class TestSQLAlchemyTenantContextLive:
         # Tx 3 on same session: after_begin listener should have re-applied GUC
         docs_after_rollback = (await pg_db_session.execute(stmt)).scalars().all()
         assert len(docs_after_rollback) == 1
-        assert docs_after_rollback[0].id == data["doc_a_id"]
+        assert str(docs_after_rollback[0].id) == data["doc_a_id"]
 
     @pytest.mark.asyncio
     async def test_user_only_bootstrap_clears_stale_tenant_context(self, pg_db_session: AsyncSession, pg_admin_conn):
@@ -569,12 +569,12 @@ class TestSQLAlchemyTenantContextLive:
 
         # 1. Authorize User A for Org A via real get_tenant_context() dependency
         ctx_a = await get_tenant_context(request=req, user=user_a, x_organization_id=data["org_a_id"], db=pg_db_session)
-        assert ctx_a.organization.id == data["org_a_id"]
+        assert str(ctx_a.organization.id) == data["org_a_id"]
         assert ctx_a.role == "ADMIN"
 
         docs_a = (await pg_db_session.execute(select(Document))).scalars().all()
         assert len(docs_a) == 1
-        assert docs_a[0].id == data["doc_a_id"]
+        assert str(docs_a[0].id) == data["doc_a_id"]
 
         # 2. Call set_user_context(User B) on SAME session (switching identity)
         await set_user_context(pg_db_session, data["user_b_id"])
@@ -594,13 +594,13 @@ class TestSQLAlchemyTenantContextLive:
 
         # 5. Authorize valid Org B for User B via get_tenant_context()
         ctx_b = await get_tenant_context(request=req, user=user_b, x_organization_id=data["org_b_id"], db=pg_db_session)
-        assert ctx_b.organization.id == data["org_b_id"]
+        assert str(ctx_b.organization.id) == data["org_b_id"]
         assert ctx_b.role == "ADMIN"
 
         # Assert only Org B data is visible
         docs_b = (await pg_db_session.execute(select(Document))).scalars().all()
         assert len(docs_b) == 1
-        assert docs_b[0].id == data["doc_b_id"]
+        assert str(docs_b[0].id) == data["doc_b_id"]
         assert docs_b[0].title == "Doc B Master"
 
     @pytest.mark.asyncio
