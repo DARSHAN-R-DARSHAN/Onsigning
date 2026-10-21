@@ -1,0 +1,83 @@
+name: PostgreSQL RLS Integration Verification
+
+on:
+  push:
+    branches: [ feature/single-agreement-audit, main ]
+  pull_request:
+    branches: [ feature/single-agreement-audit, main ]
+  workflow_dispatch:
+
+jobs:
+  test-postgres-rls:
+    name: PostgreSQL 16 RLS Integration Suite
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_ci_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Mask CI Credentials
+        run: |
+          echo "::add-mask::postgres_ci_password"
+          echo "::add-mask::ci_admin_secret_token"
+          echo "::add-mask::ci_app_secret_token"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            asyncpg==0.30.0 \
+            psycopg[binary]==3.2.4 \
+            pytest==8.3.4 \
+            pytest-asyncio==0.25.2 \
+            sqlalchemy==2.0.36 \
+            aiosqlite==0.20.0 \
+            fastapi==0.115.6 \
+            pydantic==2.10.4 \
+            pydantic-settings==2.7.0 \
+            "PyJWT[crypto]==2.10.1" \
+            passlib[bcrypt]==1.7.4 \
+            python-multipart==0.0.20 \
+            pymupdf==1.25.1 \
+            python-docx==1.1.2 \
+            aiofiles==24.1.0 \
+            httpx==0.28.1
+
+      - name: Run Fast SQLite Unit Suite
+        run: |
+          pytest apps/api/tests/ -v -m "not postgres_rls"
+
+      - name: Run Live PostgreSQL RLS Integration Suite
+        env:
+          RUN_POSTGRES_RLS: "true"
+          POSTGRES_HOST: "localhost"
+          POSTGRES_PORT: "5432"
+          POSTGRES_SUPERUSER: "postgres"
+          POSTGRES_SUPERUSER_PASSWORD: "postgres_ci_password"
+          POSTGRES_ADMIN_ROLE: "onsigning_admin"
+          POSTGRES_ADMIN_PASSWORD: "ci_admin_secret_token"
+          POSTGRES_APP_ROLE: "onsigning_app"
+          POSTGRES_APP_PASSWORD: "ci_app_secret_token"
+        run: |
+          pytest apps/api/tests/ -v -m "postgres_rls" --log-cli-level=INFO

@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+
+  /* Onsigning core surfaces & text */
+  --color-white: #ffffff;
+  --color-canvas: #f5f9ff;
+  --color-blue-50: #f0f7ff;
+  --color-blue-100: #eaf2ff;
+  --color-blue-200: #dcebff;
+  --color-blue-300: #93c5fd;
+  --color-blue-500: #3b82f6;
+  --color-primary: #2563eb;
+  --color-primary-hover: #1d4ed8;
+  --color-navy: #172b4d;
+  --color-text-secondary: #64748b;
+  --color-border: #dce6f1;
+  --color-focus: #2563eb;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-navy);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Accessible focus ring */
+*:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
