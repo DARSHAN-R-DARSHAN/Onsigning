@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text, ForeignKey, Index, UniqueConstraint, text, Numeric,
     TypeDecorator, JSON, event
 )
+from sqlalchemy.exc import UnboundExecutionError
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB, ARRAY
 from sqlalchemy.ext.asyncio import (
     AsyncSession, create_async_engine, async_sessionmaker
@@ -153,6 +154,42 @@ def _reapply_tenant_context_on_transaction_begin(session: Session, transaction, 
         session.info["last_applied_user_id"] = user_id
 
 
+def _get_session_dialect_name(session: AsyncSession) -> str:
+    """
+    Resolves the database dialect name for the given SQLAlchemy session.
+
+    Resolution Order:
+    1. Direct session bind or get_bind():
+       Inspects session.bind or session.get_bind() for a concrete engine/connection dialect.
+    2. Documented Fallback:
+       If the session is unbound (raises UnboundExecutionError or AttributeError on mock),
+       falls back to the dialect configured via settings.DATABASE_URL
+       ("sqlite" if is_sqlite else "postgresql").
+    """
+    bind = getattr(session, "bind", None)
+    if bind is None:
+        try:
+            bind = session.get_bind()
+        except (UnboundExecutionError, AttributeError):
+            bind = None
+
+    if bind is not None and hasattr(bind, "dialect"):
+        dialect_name = getattr(bind.dialect, "name", None)
+        if isinstance(dialect_name, str):
+            return dialect_name
+
+    return "sqlite" if is_sqlite else "postgresql"
+
+
+def _is_sqlite_session(session: AsyncSession) -> bool:
+    """
+    Determines whether the given session is backed by an SQLite dialect.
+    Prefers the session's actual engine/connection bind; falls back to the
+    default application database configuration when the session is unbound or a generic mock.
+    """
+    return _get_session_dialect_name(session) == "sqlite"
+
+
 async def set_user_context(
     session: AsyncSession,
     user_id: Union[uuid.UUID, str]
@@ -187,7 +224,7 @@ async def set_user_context(
     session.info.pop("last_applied_org_id", None)
     session.info.pop("tenant_context_reapplied_count", None)
 
-    if not is_sqlite:
+    if not _is_sqlite_session(session):
         await session.execute(
             text("SELECT set_config('app.current_user_id', :uid, true);"),
             {"uid": uid_str}
@@ -243,7 +280,8 @@ async def set_tenant_context(
     session.info["current_user_id"] = uid_str if uid_str else None
 
     # 2. If the current session already has an active transaction open, apply immediately
-    if not is_sqlite and session.in_transaction():
+    session_is_sqlite = _is_sqlite_session(session)
+    if not session_is_sqlite and session.in_transaction():
         await session.execute(
             text("SELECT set_config('app.current_user_id', :uid, true);"),
             {"uid": uid_str}
@@ -252,7 +290,7 @@ async def set_tenant_context(
             text("SELECT set_config('app.current_organization_id', :org_id, true);"),
             {"org_id": str(org_uuid)}
         )
-    elif is_sqlite:
+    elif session_is_sqlite:
         session.info["last_applied_org_id"] = str(org_uuid)
         session.info["last_applied_user_id"] = uid_str
 

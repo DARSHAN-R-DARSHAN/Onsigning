@@ -3,16 +3,18 @@ Tests for Supabase Auth JWT validation, organization authorization, and tenant i
 """
 
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.exc import UnboundExecutionError
 
 from apps.api.core.auth import create_mock_jwt, get_tenant_context
 from apps.api.core.database import (
     User, Organization, OrganizationMembership, RiskPlaybook,
-    set_user_context, set_tenant_context, async_session_factory
+    set_user_context, set_tenant_context, async_session_factory,
+    is_sqlite, _get_session_dialect_name, _is_sqlite_session
 )
 from apps.api.core.exceptions import AuthorizationError
 
@@ -540,3 +542,200 @@ async def test_subsequent_authorized_tenant_selection_establishes_correct_new_co
     await db_session.execute(select(1))
     await db_session.commit()
     assert db_session.info.get("current_organization_id") == str(org_2_id)
+
+
+# ==============================================================================
+# Task 5.12.26 Regression Tests: Dialect-Aware Tenant & User Context
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_sqlite_bound_session_retains_behavior_and_emits_no_set_config(
+    db_session: AsyncSession
+):
+    """
+    Task 5.12.26 Regression (Requirement 1):
+    Proves that a real SQLite-bound AsyncSession:
+    - Resolves its dialect dynamically as 'sqlite'.
+    - Updates session.info tracking fields (last_applied_user_id, last_applied_org_id).
+    - Does NOT attempt to execute raw PostgreSQL set_config statements (which would fail on SQLite).
+    """
+    assert _get_session_dialect_name(db_session) == "sqlite"
+    assert _is_sqlite_session(db_session) is True
+
+    user_id = str(uuid.uuid4())
+    org_id = str(uuid.uuid4())
+
+    # 1. Establish tenant context on SQLite
+    await set_tenant_context(db_session, user_id=user_id, organization_id=org_id)
+    assert db_session.info["current_organization_id"] == str(org_id)
+    assert db_session.info["current_user_id"] == str(user_id)
+    assert db_session.info["last_applied_org_id"] == str(org_id)
+    assert db_session.info["last_applied_user_id"] == str(user_id)
+
+    # 2. Reset context via set_user_context on SQLite
+    new_user_id = str(uuid.uuid4())
+    await set_user_context(db_session, user_id=new_user_id)
+    assert db_session.info.get("current_organization_id") is None
+    assert db_session.info.get("current_user_id") is None
+    assert db_session.info.get("last_applied_org_id") == ""
+    assert db_session.info.get("last_applied_user_id") == str(new_user_id)
+
+
+@pytest.mark.asyncio
+async def test_postgresql_bound_session_executes_set_config_when_global_is_sqlite_true():
+    """
+    Task 5.12.26 Regression (Requirement 2):
+    Proves that a PostgreSQL-bound session executes transaction-local set_config SQL
+    even when the module-level is_sqlite flag remains True.
+    """
+    assert is_sqlite is True, "Precondition: default module-level is_sqlite must be True in unit test env."
+
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_bind = MagicMock()
+    mock_bind.dialect.name = "postgresql"
+    mock_session.get_bind.return_value = mock_bind
+    mock_session.in_transaction.return_value = True
+    mock_session.info = {}
+
+    executed_queries = []
+    async def fake_execute(statement, params=None):
+        executed_queries.append((str(statement), params))
+        return AsyncMock()
+
+    mock_session.execute = fake_execute
+
+    # Dialect detection must resolve postgresql despite global is_sqlite=True
+    assert _get_session_dialect_name(mock_session) == "postgresql"
+    assert _is_sqlite_session(mock_session) is False
+
+    test_user_id = uuid.uuid4()
+    test_org_id = uuid.uuid4()
+
+    # set_tenant_context in active transaction
+    await set_tenant_context(mock_session, user_id=test_user_id, organization_id=test_org_id)
+
+    assert len(executed_queries) == 2
+    stmt_user, params_user = executed_queries[0]
+    assert "set_config('app.current_user_id'" in stmt_user
+    assert params_user == {"uid": str(test_user_id)}
+
+    stmt_org, params_org = executed_queries[1]
+    assert "set_config('app.current_organization_id'" in stmt_org
+    assert params_org == {"org_id": str(test_org_id)}
+
+
+@pytest.mark.asyncio
+async def test_postgresql_bound_session_set_user_context_clears_stale_org_context():
+    """
+    Task 5.12.26 Regression (Requirement 3):
+    Proves that set_user_context() on a PostgreSQL-bound session cleanses session.info
+    and executes SQL:
+    1. SELECT set_config('app.current_user_id', :uid, true);
+    2. SELECT set_config('app.current_organization_id', '', true);
+    """
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_bind = MagicMock()
+    mock_bind.dialect.name = "postgresql"
+    mock_session.get_bind.return_value = mock_bind
+    mock_session.info = {
+        "current_organization_id": str(uuid.uuid4()),
+        "current_user_id": str(uuid.uuid4()),
+        "last_applied_org_id": str(uuid.uuid4()),
+        "tenant_context_reapplied_count": 3,
+    }
+
+    executed_queries = []
+    async def fake_execute(statement, params=None):
+        executed_queries.append((str(statement), params))
+        return AsyncMock()
+
+    mock_session.execute = fake_execute
+
+    test_user_id = uuid.uuid4()
+    await set_user_context(mock_session, user_id=test_user_id)
+
+    # 1. session.info is cleansed
+    assert mock_session.info.get("current_organization_id") is None
+    assert mock_session.info.get("current_user_id") is None
+    assert mock_session.info.get("last_applied_org_id") is None
+    assert mock_session.info.get("tenant_context_reapplied_count") is None
+
+    # 2. Both GUCs are set/cleared in PostgreSQL
+    assert len(executed_queries) == 2
+    stmt_user, params_user = executed_queries[0]
+    assert "set_config('app.current_user_id'" in stmt_user
+    assert params_user == {"uid": str(test_user_id)}
+
+    stmt_org, _ = executed_queries[1]
+    assert "set_config('app.current_organization_id', '', true)" in stmt_org
+
+
+@pytest.mark.asyncio
+async def test_postgresql_bound_session_set_tenant_context_in_active_transaction():
+    """
+    Task 5.12.26 Regression (Requirement 4):
+    Proves that set_tenant_context() applies context immediately via set_config when
+    a transaction is active, and defers execution to after_begin when no transaction is active.
+    Also verifies system-actor policy (actor_user_id=None sets current_user_id to '').
+    """
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_bind = MagicMock()
+    mock_bind.dialect.name = "postgresql"
+    mock_session.get_bind.return_value = mock_bind
+    mock_session.info = {}
+
+    executed_queries = []
+    async def fake_execute(statement, params=None):
+        executed_queries.append((str(statement), params))
+        return AsyncMock()
+
+    mock_session.execute = fake_execute
+
+    test_org_id = uuid.uuid4()
+
+    # Case A: in_transaction is False -> does NOT execute SQL immediately; populates session.info
+    mock_session.in_transaction.return_value = False
+    await set_tenant_context(mock_session, user_id=None, organization_id=test_org_id)
+    assert len(executed_queries) == 0
+    assert mock_session.info["current_organization_id"] == str(test_org_id)
+    assert mock_session.info["current_user_id"] is None
+
+    # Case B: in_transaction is True -> executes set_config immediately with system actor (empty user string)
+    mock_session.in_transaction.return_value = True
+    await set_tenant_context(mock_session, user_id=None, organization_id=test_org_id)
+    assert len(executed_queries) == 2
+    stmt_user, params_user = executed_queries[0]
+    assert "set_config('app.current_user_id'" in stmt_user
+    assert params_user == {"uid": ""}
+    stmt_org, params_org = executed_queries[1]
+    assert "set_config('app.current_organization_id'" in stmt_org
+    assert params_org == {"org_id": str(test_org_id)}
+
+
+@pytest.mark.asyncio
+async def test_unbound_session_dialect_resolution_and_fallback():
+    """
+    Task 5.12.26 Regression (Requirement 5):
+    Proves that:
+    1. An unbound session raising UnboundExecutionError deliberately falls back to the configured default.
+    2. A mock session lacking a concrete dialect string deliberately falls back to the configured default.
+    3. The fallback is documented and explicit, not a broad silent exception swallow.
+    """
+    # Case 1: Unbound session raising UnboundExecutionError
+    unbound_session = AsyncMock(spec=AsyncSession)
+    unbound_session.get_bind.side_effect = UnboundExecutionError("Session is not bound to an Engine.")
+    assert _get_session_dialect_name(unbound_session) == ("sqlite" if is_sqlite else "postgresql")
+
+    # Case 2: Generic mock session whose get_bind().dialect.name is a MagicMock (not a str)
+    generic_mock = AsyncMock(spec=AsyncSession)
+    assert not isinstance(generic_mock.get_bind().dialect.name, str)
+    assert _get_session_dialect_name(generic_mock) == ("sqlite" if is_sqlite else "postgresql")
+
+    # Case 3: Explicit patching of is_sqlite works deterministically on unbound sessions
+    with patch("apps.api.core.database.is_sqlite", False):
+        assert _get_session_dialect_name(unbound_session) == "postgresql"
+        assert _is_sqlite_session(unbound_session) is False
+
+    with patch("apps.api.core.database.is_sqlite", True):
+        assert _get_session_dialect_name(unbound_session) == "sqlite"
+        assert _is_sqlite_session(unbound_session) is True
