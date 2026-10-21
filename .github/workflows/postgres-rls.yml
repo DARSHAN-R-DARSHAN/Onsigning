@@ -65,7 +65,7 @@ jobs:
 
       - name: Run Fast SQLite Unit Suite
         run: |
-          pytest apps/api/tests/ -v -m "not postgres_rls"
+          python -m pytest apps/api/tests/ -v -m "not postgres_rls"
 
       - name: Run Live PostgreSQL RLS Integration Suite
         env:
@@ -79,4 +79,4 @@ jobs:
           POSTGRES_APP_ROLE: "onsigning_app"
           POSTGRES_APP_PASSWORD: "ci_app_secret_token"
         run: |
-          pytest apps/api/tests/ -v -m "postgres_rls" --log-cli-level=INFO
+          python -m pytest apps/api/tests/ -v -m "postgres_rls" --log-cli-level=INFO
