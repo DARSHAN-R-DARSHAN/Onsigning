@@ -162,14 +162,16 @@ class PortableJSON(TypeDecorator):
     Emits native PostgreSQL JSONB, and JSON on SQLite.
     Transparently handles pre-serialized JSON strings, native dicts, lists,
     primitives, and None on bind. Rejects malformed JSON strings with ValueError.
+    Binds Python None as SQL NULL (none_as_null=True), while explicit serialized
+    JSON "null" text binds as JSON null (JSON.NULL).
     """
-    impl = JSON
+    impl = JSON(none_as_null=True)
     cache_ok = True
 
     def load_dialect_impl(self, dialect):
         if dialect.name == "postgresql":
-            return dialect.type_descriptor(JSONB)
-        return dialect.type_descriptor(JSON)
+            return dialect.type_descriptor(JSONB(none_as_null=True))
+        return dialect.type_descriptor(JSON(none_as_null=True))
 
     def process_bind_param(self, value, dialect):
         if value is None:
@@ -183,6 +185,8 @@ class PortableJSON(TypeDecorator):
 
             if not is_valid:
                 raise ValueError("Invalid JSON string payload")
+            if parsed is None:
+                return JSON.NULL
             return parsed
         return value
 

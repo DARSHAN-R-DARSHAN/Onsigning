@@ -625,7 +625,7 @@ class TestSQLAlchemyTenantContextLive:
 
     @pytest.mark.asyncio
     async def test_system_worker_context_no_user_uuid(self, pg_db_session: AsyncSession, pg_admin_conn):
-        """Proves system-worker context sets app.current_user_id = '' and writes actor_user_id = NULL in audit_logs."""
+        """Proves system-worker context sets app.current_user_id = '' and writes actor_user_id = NULL and previous_state = SQL NULL in audit_logs."""
         data = await _seed_tenants_and_users(pg_admin_conn)
 
         # Background worker sets tenant context with user_id=None

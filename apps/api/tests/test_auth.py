@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, insert, Enum, JSON
+from sqlalchemy import select, insert, Enum, JSON, text
 from sqlalchemy.dialects.postgresql.asyncpg import dialect as asyncpg_dialect
 from sqlalchemy.exc import UnboundExecutionError
 
@@ -1269,26 +1269,42 @@ async def test_doc_hierarchy_type_alias_coercion_and_validation(db_session: Asyn
 
 def test_portable_json_type_decorator_logic():
     """
-    Task 5.12.39 Regression:
+    Task 5.12.39 & Task 5.12.46 Regression:
     Proves that PortableJSON:
     1. Loads PostgreSQL JSONB for postgresql dialect and JSON for sqlite dialect.
-    2. Binds None -> None (SQL NULL).
-    3. Transparently decodes valid pre-serialized JSON strings (dicts, lists).
-    4. Passes native Python dicts and lists through without double-encoding.
-    5. Rejects malformed JSON strings on the bind path with ValueError.
-    6. Returns JSON strings on result processing to maintain backwards compatibility with existing callers.
+    2. Enforces none_as_null=True across impl and dialect implementations.
+    3. Binds None -> None (SQL NULL), while explicit serialized JSON text "null" binds as JSON.NULL ('null').
+    4. Transparently decodes valid pre-serialized JSON strings (dicts, lists).
+    5. Passes native Python dicts and lists through without double-encoding.
+    6. Rejects malformed JSON strings on the bind path with ValueError.
+    7. Returns JSON strings on result processing to maintain backwards compatibility with existing callers.
     """
     pj = PortableJSON()
     pg_dialect = asyncpg_dialect()
     sq_dialect = sqlite.dialect()
 
-    # 1. Dialect implementation mapping
-    assert isinstance(pj.load_dialect_impl(pg_dialect), postgresql.JSONB)
-    assert isinstance(pj.load_dialect_impl(sq_dialect), JSON)
+    # 1. Dialect implementation mapping and none_as_null configuration
+    pg_impl = pj.load_dialect_impl(pg_dialect)
+    sq_impl = pj.load_dialect_impl(sq_dialect)
+    assert isinstance(pg_impl, postgresql.JSONB)
+    assert isinstance(sq_impl, JSON)
+    assert pj.impl.none_as_null is True
+    assert pg_impl.none_as_null is True
+    assert sq_impl.none_as_null is True
 
     # 2. Bind parameter processing
     assert pj.process_bind_param(None, pg_dialect) is None
     assert pj.process_bind_param(None, sq_dialect) is None
+    assert pj.process_bind_param("null", pg_dialect) is JSON.NULL
+    assert pj.process_bind_param("null", sq_dialect) is JSON.NULL
+
+    # Bind processors ensure SQL NULL for None and JSON scalar 'null' for explicit "null"
+    bp_pg = pj.bind_processor(pg_dialect)
+    bp_sq = pj.bind_processor(sq_dialect)
+    assert bp_pg(None) is None
+    assert bp_sq(None) is None
+    assert bp_pg("null") == "null"
+    assert bp_sq("null") == "null"
 
     # Pre-serialized strings are decoded
     assert pj.process_bind_param('{"key": "value", "count": 1}', pg_dialect) == {"key": "value", "count": 1}
@@ -1311,6 +1327,52 @@ def test_portable_json_type_decorator_logic():
     assert pj.process_result_value({"key": "value"}, pg_dialect) == json.dumps({"key": "value"})
     assert pj.process_result_value(["a", "b"], sq_dialect) == json.dumps(["a", "b"])
     assert pj.process_result_value('{"already": "str"}', pg_dialect) == '{"already": "str"}'
+
+
+def test_portable_json_sql_null_vs_json_null_semantics():
+    """
+    Task 5.12.46 Regression:
+    Proves that PortableJSON:
+    1. Sets none_as_null=True on impl and dialect-specific type descriptors.
+    2. Compiles Python None to SQL NULL for both PostgreSQL asyncpg and SQLite.
+    3. Preserves explicit serialized JSON string "null" as JSON.NULL / 'null' (distinct from SQL NULL).
+    4. Passes native dicts/lists and valid pre-serialized JSON strings intact.
+    5. Retains sanitization against malformed JSON strings without leaking payload or chain.
+    """
+    pj = PortableJSON()
+    pg_dialect = asyncpg_dialect()
+    sq_dialect = sqlite.dialect()
+
+    # Configuration
+    assert pj.impl.none_as_null is True
+    assert pj.load_dialect_impl(pg_dialect).none_as_null is True
+    assert pj.load_dialect_impl(sq_dialect).none_as_null is True
+
+    # Bind processors
+    bp_pg = pj.bind_processor(pg_dialect)
+    bp_sq = pj.bind_processor(sq_dialect)
+
+    # 1. Python None -> SQL NULL (None)
+    assert bp_pg(None) is None
+    assert bp_sq(None) is None
+
+    # 2. Explicit "null" string -> JSON 'null'
+    assert bp_pg("null") == "null"
+    assert bp_sq("null") == "null"
+    assert bp_pg("  null  ") == "null"
+    assert bp_sq("  null  ") == "null"
+
+    # 3. Native dict and valid JSON string
+    assert bp_pg({"key": "val"}) == '{"key": "val"}'
+    assert bp_sq({"key": "val"}) == '{"key": "val"}'
+    assert bp_pg('{"key": "val"}') == '{"key": "val"}'
+    assert bp_sq('{"key": "val"}') == '{"key": "val"}'
+
+    # 4. Result processor preserves None as None
+    rp_pg = pj.result_processor(pg_dialect, None)
+    rp_sq = pj.result_processor(sq_dialect, None)
+    assert rp_pg(None) is None
+    assert rp_sq(None) is None
 
 
 def test_portable_json_bind_param_sanitizes_malformed_error_message():
@@ -1482,6 +1544,36 @@ async def test_portable_json_sqlite_live_roundtrip(db_session: AsyncSession):
     assert q_log.previous_state is None
     assert isinstance(q_log.new_state, str)
     assert json.loads(q_log.new_state) == {"status": "SUCCESS"}
+
+    # Raw driver SQL verification: proves previous_state=None is physically SQL NULL (None), not 'null'
+    raw_log = (await db_session.execute(
+        text("SELECT previous_state, new_state FROM audit_logs WHERE id = :id"),
+        {"id": audit_log_id}
+    )).mappings().one()
+    assert raw_log["previous_state"] is None
+    assert json.loads(raw_log["new_state"]) == {"status": "SUCCESS"}
+
+    # Prove explicit serialized JSON "null" string stores literal 'null' (distinguishable from SQL NULL)
+    audit_log_null_id = str(uuid.uuid4())
+    audit_log_null = AuditLog(
+        id=audit_log_null_id,
+        organization_id=org_id,
+        actor_user_id=None,
+        actor_type="SYSTEM_WORKER",
+        entity_table="documents",
+        entity_id=doc_id,
+        action="BACKGROUND_AUDIT_COMPLETED",
+        previous_state="null",
+        new_state={"status": "SUCCESS"}
+    )
+    db_session.add(audit_log_null)
+    await db_session.commit()
+
+    raw_null_log = (await db_session.execute(
+        text("SELECT previous_state FROM audit_logs WHERE id = :id"),
+        {"id": audit_log_null_id}
+    )).scalar_one()
+    assert raw_null_log == "null"
 
     # Update nullable error_detail and previous_state to verify updates work
     q_doc.error_detail = json.dumps({"reason": "manual test"})
