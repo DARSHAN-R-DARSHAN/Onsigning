@@ -12,7 +12,7 @@ from apps.api.core.config import settings
 from apps.api.core.logging import logger
 from apps.api.core.exceptions import OnsigningException
 from apps.api.core.database import engine, Base
-from apps.api.routers import health, documents, audits, playbooks
+from apps.api.routers import health, documents, audits, playbooks, organizations
 
 
 @asynccontextmanager
@@ -84,6 +84,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 # Mount Feature 1 Routers
 app.include_router(health.router)
+app.include_router(organizations.router)
 app.include_router(documents.router)
 app.include_router(audits.router)
 app.include_router(playbooks.router)
