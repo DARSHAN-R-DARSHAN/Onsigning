@@ -650,11 +650,14 @@ class TestSQLAlchemyTenantContextLive:
         pg_db_session.add(log)
         await pg_db_session.commit()
 
-        # Query audit log via admin connection to verify actor_user_id is NULL
+        # Query audit log via admin connection to verify actor_user_id is NULL and JSONB state persisted
         row = await pg_admin_conn.fetchrow(
-            "SELECT actor_user_id, actor_type, action FROM audit_logs WHERE id = $1;",
+            "SELECT actor_user_id, actor_type, action, previous_state, new_state FROM audit_logs WHERE id = $1;",
             uuid.UUID(log_id)
         )
         assert row["actor_user_id"] is None
         assert row["actor_type"] == "SYSTEM_WORKER"
         assert row["action"] == "BACKGROUND_AUDIT_COMPLETED"
+        assert row["previous_state"] is None
+        actual_new_state = json.loads(row["new_state"]) if isinstance(row["new_state"], str) else row["new_state"]
+        assert actual_new_state == {"status": "SUCCESS"}

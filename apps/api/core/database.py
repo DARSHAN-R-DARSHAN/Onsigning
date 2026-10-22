@@ -156,6 +156,44 @@ class PortableUUID(TypeDecorator):
         return str(value)
 
 
+class PortableJSON(TypeDecorator):
+    """
+    Portable JSON/JSONB Type.
+    Emits native PostgreSQL JSONB, and JSON on SQLite.
+    Transparently handles pre-serialized JSON strings, native dicts, lists,
+    primitives, and None on bind. Rejects malformed JSON strings with ValueError.
+    """
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(JSONB)
+        return dialect.type_descriptor(JSON)
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            is_valid = True
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                is_valid = False
+
+            if not is_valid:
+                raise ValueError("Invalid JSON string payload")
+            return parsed
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return value
+
+
 @event.listens_for(Session, "after_begin")
 def _reapply_tenant_context_on_transaction_begin(session: Session, transaction, connection):
     """
@@ -498,7 +536,7 @@ class RiskPlaybook(Base):
     name = Column(String(255), nullable=False)
     version = Column(Integer, nullable=False, default=1)
     description = Column(Text, nullable=True)
-    rules = Column(Text, nullable=False)  # Stored as JSON string
+    rules = Column(PortableJSON, nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
     created_by = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -528,10 +566,10 @@ class Document(Base):
     processing_status = Column(DocProcessingStatusEnum, nullable=False, default="UPLOADED")  # doc_processing_status
     page_count = Column(Integer, nullable=True)
     unreadable_pages = Column(PortableIntArray, nullable=True, default=list)  # INT[] in PostgreSQL, JSON list in SQLite
-    parser_warnings = Column(Text, nullable=True, default="[]")   # JSON list of warnings
+    parser_warnings = Column(PortableJSON, nullable=True, default=list)
     error_category = Column(DocErrorCategoryEnum, nullable=True)            # doc_error_category
     error_message = Column(Text, nullable=True)
-    error_detail = Column(Text, nullable=True)                    # JSON diagnostics
+    error_detail = Column(PortableJSON, nullable=True)
     failed_at = Column(DateTime(timezone=True), nullable=True)
     effective_date = Column(Date, nullable=True)
     expiration_date = Column(Date, nullable=True)
@@ -594,7 +632,7 @@ class AuditRun(Base):
     status = Column(String(50), nullable=False, default="COMPLETED")
     started_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
-    summary = Column(Text, nullable=False, default="{}")  # JSON summary
+    summary = Column(PortableJSON, nullable=False, default=dict)
     created_by = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     __table_args__ = (
@@ -615,7 +653,7 @@ class RiskAlert(Base):
     rule_id = Column(String(64), nullable=False)
     title = Column(String(255), nullable=False)
     explanation = Column(Text, nullable=False)
-    evidence_payload = Column(Text, nullable=False)  # JSON snapshot of evidence
+    evidence_payload = Column(PortableJSON, nullable=False)
     review_status = Column(ReviewStatusEnum, nullable=False, default="AI_EVALUATED")  # review_status
     reviewed_by = Column(PortableUUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     reviewed_at = Column(DateTime(timezone=True), nullable=True)
@@ -640,8 +678,8 @@ class AuditLog(Base):
     entity_table = Column(String(100), nullable=False)
     entity_id = Column(PortableUUID, nullable=False)
     action = Column(String(50), nullable=False)
-    previous_state = Column(Text, nullable=True)
-    new_state = Column(Text, nullable=True)
+    previous_state = Column(PortableJSON, nullable=True)
+    new_state = Column(PortableJSON, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
     __table_args__ = (

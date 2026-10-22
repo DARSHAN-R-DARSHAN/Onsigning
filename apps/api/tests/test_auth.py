@@ -2,12 +2,14 @@
 Tests for Supabase Auth JWT validation, organization authorization, and tenant isolation.
 """
 
+import json
+import traceback
 import uuid
 from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, insert, Enum
+from sqlalchemy import select, insert, Enum, JSON
 from sqlalchemy.dialects.postgresql.asyncpg import dialect as asyncpg_dialect
 from sqlalchemy.exc import UnboundExecutionError
 
@@ -15,7 +17,7 @@ from apps.api.core.auth import create_mock_jwt, get_tenant_context
 from apps.api.core.database import (
     User, Organization, OrganizationMembership, RiskPlaybook,
     Document, ExtractedClause, AuditRun, RiskAlert, AuditLog,
-    PortableUUID, DocHierarchyTypeEnum,
+    PortableUUID, PortableJSON, DocHierarchyTypeEnum,
     set_user_context, set_tenant_context, async_session_factory,
     is_sqlite, _get_session_dialect_name, _is_sqlite_session
 )
@@ -1263,3 +1265,231 @@ async def test_doc_hierarchy_type_alias_coercion_and_validation(db_session: Asyn
 
     assert loaded_1.hierarchy_type == "MSA"
     assert loaded_2.hierarchy_type == "SOW"
+
+
+def test_portable_json_type_decorator_logic():
+    """
+    Task 5.12.39 Regression:
+    Proves that PortableJSON:
+    1. Loads PostgreSQL JSONB for postgresql dialect and JSON for sqlite dialect.
+    2. Binds None -> None (SQL NULL).
+    3. Transparently decodes valid pre-serialized JSON strings (dicts, lists).
+    4. Passes native Python dicts and lists through without double-encoding.
+    5. Rejects malformed JSON strings on the bind path with ValueError.
+    6. Returns JSON strings on result processing to maintain backwards compatibility with existing callers.
+    """
+    pj = PortableJSON()
+    pg_dialect = asyncpg_dialect()
+    sq_dialect = sqlite.dialect()
+
+    # 1. Dialect implementation mapping
+    assert isinstance(pj.load_dialect_impl(pg_dialect), postgresql.JSONB)
+    assert isinstance(pj.load_dialect_impl(sq_dialect), JSON)
+
+    # 2. Bind parameter processing
+    assert pj.process_bind_param(None, pg_dialect) is None
+    assert pj.process_bind_param(None, sq_dialect) is None
+
+    # Pre-serialized strings are decoded
+    assert pj.process_bind_param('{"key": "value", "count": 1}', pg_dialect) == {"key": "value", "count": 1}
+    assert pj.process_bind_param('["a", "b", 3]', sq_dialect) == ["a", "b", 3]
+
+    # Native objects are passed through
+    assert pj.process_bind_param({"status": "SUCCESS"}, pg_dialect) == {"status": "SUCCESS"}
+    assert pj.process_bind_param([1, 2, 3], sq_dialect) == [1, 2, 3]
+
+    # Malformed strings raise ValueError
+    with pytest.raises(ValueError, match="^Invalid JSON string payload$"):
+        pj.process_bind_param("not valid json {", pg_dialect)
+
+    with pytest.raises(ValueError, match="^Invalid JSON string payload$"):
+        pj.process_bind_param("{unquoted_key: 1}", sq_dialect)
+
+    # 3. Result value processing
+    assert pj.process_result_value(None, pg_dialect) is None
+    assert pj.process_result_value(None, sq_dialect) is None
+    assert pj.process_result_value({"key": "value"}, pg_dialect) == json.dumps({"key": "value"})
+    assert pj.process_result_value(["a", "b"], sq_dialect) == json.dumps(["a", "b"])
+    assert pj.process_result_value('{"already": "str"}', pg_dialect) == '{"already": "str"}'
+
+
+def test_portable_json_bind_param_sanitizes_malformed_error_message():
+    """
+    Task 5.12.41 & 5.12.42 Regression:
+    Proves that when PortableJSON encounters malformed JSON on bind:
+    1. It raises ValueError("Invalid JSON string payload").
+    2. The exception message and repr do not embed or leak the rejected input payload or any excerpt.
+    3. The exception chaining (__cause__ and __context__) is completely detached (None) so the
+       original JSONDecodeError and its .doc payload cannot leak.
+    4. Formatted tracebacks do not contain the rejected payload or confidential sentinels.
+    """
+    pj = PortableJSON()
+    sentinel = "CONFIDENTIAL_CONTRACT_SECRET_CLAUSE_PAYLOAD_XYZ"
+    malformed_payload = f'{{"confidential_data": "{sentinel}", broken_json'
+
+    with pytest.raises(ValueError) as exc_info:
+        pj.process_bind_param(malformed_payload, None)
+
+    exc = exc_info.value
+    # 1. Raises intended ValueError
+    assert str(exc) == "Invalid JSON string payload"
+    # 2. Exception message and repr do not contain the sentinel
+    assert sentinel not in str(exc)
+    assert sentinel not in repr(exc)
+    # 3. Exception chaining: __cause__ and __context__ are strictly None
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    # 4. Formatted traceback does not contain the sentinel
+    formatted_tb = "".join(traceback.format_exception(exc))
+    assert sentinel not in formatted_tb
+
+
+def test_jsonb_postgresql_statement_compilation_all_7_columns():
+    """
+    Task 5.12.39 Regression:
+    Proves that all 7 JSONB-backed columns compile with $n::JSONB under PostgreSQL asyncpg:
+    1. AuditLog.previous_state
+    2. AuditLog.new_state
+    3. RiskPlaybook.rules
+    4. Document.parser_warnings
+    5. Document.error_detail
+    6. AuditRun.summary
+    7. RiskAlert.evidence_payload
+    """
+    test_cases = [
+        (AuditLog, "previous_state", {"old": "state"}),
+        (AuditLog, "new_state", {"new": "state"}),
+        (RiskPlaybook, "rules", [{"rule_id": "TEST_001"}]),
+        (Document, "parser_warnings", [{"page": 1, "warning": "low_res"}]),
+        (Document, "error_detail", {"error_code": "ERR_CORRUPT"}),
+        (AuditRun, "summary", {"critical_count": 0, "total": 1}),
+        (RiskAlert, "evidence_payload", {"quote": "sample quote", "verified": True}),
+    ]
+
+    pg_dialect = asyncpg_dialect()
+    for model, col_name, sample_val in test_cases:
+        stmt = insert(model).values({col_name: sample_val})
+        compiled_sql = str(stmt.compile(dialect=pg_dialect))
+        assert "::JSONB" in compiled_sql, f"Expected ::JSONB in {compiled_sql} for {model.__name__}.{col_name}"
+
+
+@pytest.mark.asyncio
+async def test_portable_json_sqlite_live_roundtrip(db_session: AsyncSession):
+    """
+    Task 5.12.39 Regression:
+    Proves live SQLite session round-trip storage, nullability, pre-serialized vs dict binds,
+    and string result handling across all 5 models and 7 JSONB-backed fields.
+    """
+    org_id = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
+    playbook_id = str(uuid.uuid4())
+    audit_run_id = str(uuid.uuid4())
+    alert_id = str(uuid.uuid4())
+    audit_log_id = str(uuid.uuid4())
+
+    org = Organization(id=org_id, name="JSON Test Org", slug=f"json-test-{uuid.uuid4().hex[:8]}")
+    db_session.add(org)
+    await db_session.commit()
+
+    # 1. Document: parser_warnings as list, error_detail as None
+    doc = Document(
+        id=doc_id,
+        organization_id=org_id,
+        title="JSON Doc",
+        original_filename="doc.pdf",
+        storage_key="keys/doc.pdf",
+        sha256=f"sha_{uuid.uuid4().hex}",
+        mime_type="application/pdf",
+        byte_size=1024,
+        parser_warnings=[{"page": 1, "message": "unclear text"}],
+        error_detail=None
+    )
+
+    # 2. RiskPlaybook: rules as pre-serialized JSON string
+    rules_payload = [{"rule_id": "R1", "operator": "EQUALS"}]
+    playbook = RiskPlaybook(
+        id=playbook_id,
+        organization_id=org_id,
+        name="JSON Playbook",
+        version=1,
+        description="Testing JSON columns",
+        rules=json.dumps(rules_payload)
+    )
+
+    # 3. AuditRun: summary as native dict
+    summary_payload = {"total_rules": 4, "passed": 3, "critical_alerts": 0}
+    audit_run = AuditRun(
+        id=audit_run_id,
+        organization_id=org_id,
+        document_id=doc_id,
+        playbook_id=playbook_id,
+        playbook_version=1,
+        status="COMPLETED",
+        summary=summary_payload
+    )
+
+    # 4. RiskAlert: evidence_payload as pre-serialized string
+    evidence_payload = {"quote": "30 days prior notice", "page": 4}
+    risk_alert = RiskAlert(
+        id=alert_id,
+        organization_id=org_id,
+        audit_run_id=audit_run_id,
+        rule_id="R1",
+        severity="LOW",
+        title="Notice Alert",
+        explanation="Notice period is standard",
+        review_status="AI_EVALUATED",
+        evidence_payload=json.dumps(evidence_payload)
+    )
+
+    # 5. AuditLog: previous_state as None, new_state as native dict
+    audit_log = AuditLog(
+        id=audit_log_id,
+        organization_id=org_id,
+        actor_user_id=None,
+        actor_type="SYSTEM_WORKER",
+        entity_table="documents",
+        entity_id=doc_id,
+        action="BACKGROUND_AUDIT_COMPLETED",
+        previous_state=None,
+        new_state={"status": "SUCCESS"}
+    )
+
+    db_session.add_all([doc, playbook, audit_run, risk_alert, audit_log])
+    await db_session.commit()
+
+    db_session.expire_all()
+
+    # Query and verify
+    q_doc = (await db_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
+    assert q_doc.error_detail is None
+    assert isinstance(q_doc.parser_warnings, str)
+    assert json.loads(q_doc.parser_warnings) == [{"page": 1, "message": "unclear text"}]
+
+    q_playbook = (await db_session.execute(select(RiskPlaybook).where(RiskPlaybook.id == playbook_id))).scalar_one()
+    assert isinstance(q_playbook.rules, str)
+    assert json.loads(q_playbook.rules) == rules_payload
+
+    q_audit_run = (await db_session.execute(select(AuditRun).where(AuditRun.id == audit_run_id))).scalar_one()
+    assert isinstance(q_audit_run.summary, str)
+    assert json.loads(q_audit_run.summary) == summary_payload
+
+    q_alert = (await db_session.execute(select(RiskAlert).where(RiskAlert.id == alert_id))).scalar_one()
+    assert isinstance(q_alert.evidence_payload, str)
+    assert json.loads(q_alert.evidence_payload) == evidence_payload
+
+    q_log = (await db_session.execute(select(AuditLog).where(AuditLog.id == audit_log_id))).scalar_one()
+    assert q_log.previous_state is None
+    assert isinstance(q_log.new_state, str)
+    assert json.loads(q_log.new_state) == {"status": "SUCCESS"}
+
+    # Update nullable error_detail and previous_state to verify updates work
+    q_doc.error_detail = json.dumps({"reason": "manual test"})
+    q_log.previous_state = {"status": "PENDING"}
+    await db_session.commit()
+
+    db_session.expire_all()
+    updated_doc = (await db_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
+    updated_log = (await db_session.execute(select(AuditLog).where(AuditLog.id == audit_log_id))).scalar_one()
+    assert json.loads(updated_doc.error_detail) == {"reason": "manual test"}
+    assert json.loads(updated_log.previous_state) == {"status": "PENDING"}
