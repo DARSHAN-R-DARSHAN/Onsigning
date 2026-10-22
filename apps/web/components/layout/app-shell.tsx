@@ -14,7 +14,6 @@ import {
   Building2,
   Menu,
   X,
-  Shield,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 

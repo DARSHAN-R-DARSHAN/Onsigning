@@ -7,13 +7,8 @@ import {
   ChevronRight,
   ZoomIn,
   ZoomOut,
-  Maximize2,
-  Search,
   FileText,
-  AlertCircle,
-  ExternalLink,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 
 interface DocumentViewerProps {
   documentId: string;
@@ -25,16 +20,13 @@ interface DocumentViewerProps {
 }
 
 export function DocumentViewer({
-  documentId,
   documentTitle,
   totalPages = 1,
   highlightPage = 1,
   highlightQuote,
-  pdfUrl,
 }: DocumentViewerProps) {
   const [currentPage, setCurrentPage] = useState<number>(highlightPage || 1);
   const [zoomLevel, setZoomLevel] = useState<number>(100);
-  const [searchQuery, setSearchQuery] = useState("");
   const pageContainerRef = useRef<HTMLDivElement>(null);
 
   // Synchronize incoming highlight navigation
@@ -66,9 +58,6 @@ export function DocumentViewer({
   const handleResetZoom = () => {
     setZoomLevel(100);
   };
-
-  // Content stream endpoint
-  const contentStreamUrl = pdfUrl || `/api/v1/documents/${documentId}/content`;
 
   return (
     <div className="flex flex-col h-full bg-slate-100 border-r border-border select-none">
@@ -146,7 +135,7 @@ export function DocumentViewer({
         <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 text-xs flex items-center justify-between">
           <div className="flex items-center overflow-hidden mr-2">
             <span className="font-semibold text-amber-900 mr-2 flex-shrink-0">Verified Quote:</span>
-            <span className="italic text-amber-800 truncate font-serif">"{highlightQuote}"</span>
+            <span className="italic text-amber-800 truncate font-serif">&ldquo;{highlightQuote}&rdquo;</span>
           </div>
           <span className="text-[11px] font-mono text-amber-700 bg-amber-100/80 px-2 py-0.5 rounded flex-shrink-0">
             Page {currentPage}
@@ -184,13 +173,13 @@ export function DocumentViewer({
                     Verified Evidence Citation (Page {currentPage})
                   </div>
                   <p className="font-serif italic text-sm text-navy font-medium leading-relaxed">
-                    "{highlightQuote}"
+                    &ldquo;{highlightQuote}&rdquo;
                   </p>
                 </div>
               )}
 
               <p className="leading-relaxed text-justify text-slate-700">
-                This Master Services Agreement ("Agreement") governs the procurement and provision of enterprise software and related professional services between the Parties. Each Party covenants that it is duly organized, validly existing, and in good standing under the laws of its jurisdiction of incorporation.
+                This Master Services Agreement (&ldquo;Agreement&rdquo;) governs the procurement and provision of enterprise software and related professional services between the Parties. Each Party covenants that it is duly organized, validly existing, and in good standing under the laws of its jurisdiction of incorporation.
               </p>
 
               <p className="leading-relaxed text-justify text-slate-700">

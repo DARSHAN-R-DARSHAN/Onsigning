@@ -1,11 +1,11 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { AlertCard, RiskAlertData } from "./alert-card";
 import { CoverageWarningBanner } from "./coverage-warning-banner";
 import { ReviewActionDialog } from "./review-action-dialog";
 import { Button } from "@/components/ui/button";
-import { ShieldCheck, BookOpen, Filter, RefreshCw, Keyboard } from "lucide-react";
+import { ShieldCheck, BookOpen, RefreshCw, Keyboard } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface PlaybookSummary {
@@ -43,17 +43,19 @@ export function FindingsRail({
   } | null>(null);
 
   // Filter alerts based on selection
-  const filteredAlerts = alerts.filter((a) => {
-    if (filterMode === "UNRESOLVED") {
-      return a.review_status === "AI_EVALUATED" || a.review_status === "NEEDS_HUMAN_REVIEW";
-    }
-    if (filterMode === "CONFIRMED") {
-      return ["HUMAN_CONFIRMED", "HUMAN_OVERRIDDEN", "DISMISSED_FALSE_POSITIVE"].includes(
-        a.review_status
-      );
-    }
-    return true;
-  });
+  const filteredAlerts = useMemo(() => {
+    return alerts.filter((a) => {
+      if (filterMode === "UNRESOLVED") {
+        return a.review_status === "AI_EVALUATED" || a.review_status === "NEEDS_HUMAN_REVIEW";
+      }
+      if (filterMode === "CONFIRMED") {
+        return ["HUMAN_CONFIRMED", "HUMAN_OVERRIDDEN", "DISMISSED_FALSE_POSITIVE"].includes(
+          a.review_status
+        );
+      }
+      return true;
+    });
+  }, [alerts, filterMode]);
 
   const selectedAlert = filteredAlerts[selectedIndex] || filteredAlerts[0] || null;
 
@@ -62,7 +64,7 @@ export function FindingsRail({
     if (selectedAlert) {
       onSelectAlert(selectedAlert);
     }
-  }, [selectedIndex, filteredAlerts]);
+  }, [selectedAlert, onSelectAlert]);
 
   // Keyboard navigation shortcuts (j/k/Enter/c/o/d)
   const handleKeyDown = useCallback(
@@ -231,7 +233,7 @@ export function FindingsRail({
                 setSelectedIndex(idx);
                 onSelectAlert(alert);
               }}
-              onNavigateToCitation={(page, quote) => {
+              onNavigateToCitation={() => {
                 setSelectedIndex(idx);
                 onSelectAlert(alert);
               }}

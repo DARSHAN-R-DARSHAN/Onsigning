@@ -43,9 +43,6 @@ export function AlertCard({
   onReviewAction,
 }: AlertCardProps) {
   const { evidence } = alert;
-  const isHumanReviewed = ["HUMAN_CONFIRMED", "HUMAN_OVERRIDDEN", "DISMISSED_FALSE_POSITIVE"].includes(
-    alert.review_status
-  );
 
   return (
     <div
@@ -83,7 +80,7 @@ export function AlertCard({
           </div>
 
           <p className="font-serif italic text-navy/90 text-xs border-l-2 border-primary/50 pl-2.5 py-0.5 leading-relaxed">
-            "{evidence.quote}"
+            &ldquo;{evidence.quote}&rdquo;
           </p>
 
           {evidence.page_number && (

@@ -72,8 +72,9 @@ export function ReviewActionDialog({
       await onSubmit(config.targetStatus, note.trim());
       setNote("");
       onClose();
-    } catch (err: any) {
-      setError(err?.message || "Failed to submit review decision.");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to submit review decision.";
+      setError(message);
     } finally {
       setIsSubmitting(false);
     }

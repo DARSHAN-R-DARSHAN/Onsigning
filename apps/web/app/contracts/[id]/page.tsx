@@ -1,14 +1,15 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useCallback } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { AppShell } from "@/components/layout/app-shell";
 import { DocumentViewer } from "@/components/document/document-viewer";
 import { FindingsRail } from "@/components/audit/findings-rail";
+import { RiskAlertData } from "@/components/audit/alert-card";
 import { ProcessingStatusBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, RefreshCw, FileText, Share2, Download, AlertTriangle } from "lucide-react";
+import { ArrowLeft, RefreshCw, FileText } from "lucide-react";
 
 export default function SingleAgreementAuditPage() {
   const params = useParams();
@@ -25,7 +26,7 @@ export default function SingleAgreementAuditPage() {
   );
 
   // Mock document data conforming to Feature 1 specifications
-  const [documentData, setDocumentData] = useState({
+  const [documentData] = useState({
     id: documentId,
     title: "Master Services Agreement — Acme SaaS Platform",
     filename: "acme_saas_msa_signed.pdf",
@@ -36,13 +37,13 @@ export default function SingleAgreementAuditPage() {
     parser_warnings: [] as Array<{ page?: number; message?: string }>,
   });
 
-  const [playbookData, setPlaybookData] = useState({
+  const [playbookData] = useState({
     name: "Baseline B2B SaaS Risk Playbook",
     version: 1,
     description: "Evaluates limitation of liability caps, IP carveouts, governing law, and auto-renewal notice periods.",
   });
 
-  const [alerts, setAlerts] = useState<any[]>([
+  const [alerts, setAlerts] = useState<RiskAlertData[]>([
     {
       id: "alert-lol-01",
       rule_id: "RULE_LOL_CAP_MINIMUM",
@@ -96,16 +97,16 @@ export default function SingleAgreementAuditPage() {
     },
   ]);
 
-  const handleSelectAlert = (alert: any) => {
+  const handleSelectAlert = useCallback((alert: RiskAlertData) => {
     if (alert.evidence.page_number) {
       setHighlightPage(alert.evidence.page_number);
       setHighlightQuote(alert.evidence.quote);
       // On mobile, switch to document viewer to view citation
-      if (window.innerWidth < 1024) {
+      if (typeof window !== "undefined" && window.innerWidth < 1024) {
         setMobileTab("DOCUMENT");
       }
     }
-  };
+  }, []);
 
   const handleUpdateAlertReview = async (alertId: string, status: string, note: string) => {
     // In production, calls PATCH /api/v1/audits/alerts/{alertId}/review
@@ -115,7 +116,7 @@ export default function SingleAgreementAuditPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ review_status: status, review_note: note }),
       }).catch(() => null);
-    } catch (e) {
+    } catch {
       // offline/mock fallback
     }
 
@@ -140,7 +141,7 @@ export default function SingleAgreementAuditPage() {
       setTimeout(() => {
         setIsRerunning(false);
       }, 1200);
-    } catch (e) {
+    } catch {
       setIsRerunning(false);
     }
   };

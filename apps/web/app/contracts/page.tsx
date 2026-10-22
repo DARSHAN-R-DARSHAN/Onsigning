@@ -12,9 +12,6 @@ import {
   Search,
   Filter,
   ArrowRight,
-  RefreshCw,
-  AlertCircle,
-  Clock,
 } from "lucide-react";
 import { formatBytes } from "@/lib/utils";
 
@@ -37,7 +34,7 @@ export default function ContractsListPage() {
   const [statusFilter, setStatusFilter] = useState("ALL");
 
   // Sample seed data conforming to Feature 1 single-agreement audit
-  const [documents, setDocuments] = useState<ContractDocumentItem[]>([
+  const [documents] = useState<ContractDocumentItem[]>([
     {
       id: "doc-sample-msa-001",
       title: "Master Cloud Services Agreement — Datadog Inc.",

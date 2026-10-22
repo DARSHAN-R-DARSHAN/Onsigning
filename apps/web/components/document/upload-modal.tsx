@@ -2,7 +2,7 @@
 
 import React, { useState, useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { X, UploadCloud, FileText, AlertCircle, CheckCircle2 } from "lucide-react";
+import { X, UploadCloud, AlertCircle, CheckCircle2 } from "lucide-react";
 import { formatBytes } from "@/lib/utils";
 
 interface UploadModalProps {
@@ -95,8 +95,9 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
       const data = await res.json();
       onSuccess(data.id);
       onClose();
-    } catch (err: any) {
-      setError(err?.message || "Failed to upload document. Please try again.");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to upload document. Please try again.";
+      setError(message);
     } finally {
       setIsUploading(false);
     }
