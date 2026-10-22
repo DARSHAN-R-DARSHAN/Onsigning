@@ -21,7 +21,7 @@ from apps.api.core.logging import logger
 from apps.api.ai_pipeline.parser import parse_document, ParsedDocument
 from apps.api.ai_pipeline.extractor import extract_clauses
 from apps.api.ai_pipeline.schemas import (
-    DocProcessingStatus, DocErrorCategory, ReviewStatus, RiskPlaybookConfig,
+    DocProcessingStatus, DocErrorCategory, ReviewStatus, PlaybookRuleConfig,
     CitationStatus, PresenceStatus, ExtractedClauseFact
 )
 from apps.api.services.verifier import verify_citation
@@ -86,9 +86,13 @@ class AuditService:
                 db.add(playbook)
                 await db.flush()
 
+        rules_raw = json.loads(playbook.rules) if isinstance(playbook.rules, str) else playbook.rules
+        if not isinstance(rules_raw, list):
+            raise ValueError("Playbook rules must be a list of rule configurations")
         playbook_config_rules = [
-            RiskPlaybookConfig.model_validate(json.loads(f'{{"playbook_name": "{playbook.name}", "version": {playbook.version}, "description": "", "rules": {playbook.rules}}}')).rules
-        ][0]
+            PlaybookRuleConfig.model_validate(rule) if not isinstance(rule, PlaybookRuleConfig) else rule
+            for rule in rules_raw
+        ]
 
         # 3. Stage A: Layout Parsing
         document.processing_status = DocProcessingStatus.PARSING_LAYOUT.value
