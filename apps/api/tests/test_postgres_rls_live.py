@@ -456,6 +456,75 @@ class TestDirectPostgresRLS:
         assert "does not exist in cluster" in err_msg
 
     @pytest.mark.asyncio
+    async def test_security_hardening_migration_fails_closed_when_prerequisites_missing(self, pg_admin_conn):
+        """
+        Proves that 0003_security_hardening.sql executes a fail-closed pre-validation check
+        and raises an explicit exception if the required onsigning_app role or prerequisite tables are absent.
+        """
+        migration_file = Path(__file__).resolve().parents[3] / "packages" / "database" / "migrations" / "0003_security_hardening.sql"
+        assert migration_file.is_file(), "0003_security_hardening.sql must exist"
+
+        migration_sql = migration_file.read_text(encoding="utf-8")
+
+        # 1. Test missing onsigning_app role
+        missing_role_sql = migration_sql.replace("'onsigning_app'", "'onsigning_nonexistent_role'")
+        with pytest.raises(Exception) as exc_role:
+            await pg_admin_conn.execute(missing_role_sql)
+        assert "Prerequisite role missing" in str(exc_role.value)
+
+        # 2. Test missing prerequisite table
+        missing_table_sql = migration_sql.replace("'audit_logs'", "'nonexistent_audit_logs'")
+        with pytest.raises(Exception) as exc_table:
+            await pg_admin_conn.execute(missing_table_sql)
+        assert "Prerequisite schema missing" in str(exc_table.value)
+
+    @pytest.mark.asyncio
+    async def test_security_hardening_migration_idempotent_double_run(self, pg_admin_conn):
+        """
+        Proves that 0003_security_hardening.sql can be executed multiple times
+        without syntax errors, duplicate-key errors, or catalog corruption.
+        """
+        migration_file = Path(__file__).resolve().parents[3] / "packages" / "database" / "migrations" / "0003_security_hardening.sql"
+        migration_sql = migration_file.read_text(encoding="utf-8")
+
+        # Execute migration 0003 a second time against the active test database
+        await pg_admin_conn.execute(migration_sql)
+
+    @pytest.mark.asyncio
+    async def test_security_hardening_effective_table_privileges(self, pg_app_conn):
+        """
+        Verifies that after 0003_security_hardening.sql, onsigning_app has exact
+        least-privilege permissions on both audit_logs and users:
+        - audit_logs: SELECT and INSERT only; UPDATE, DELETE, TRUNCATE denied.
+        - users: SELECT, INSERT, UPDATE, DELETE permitted; TRUNCATE denied.
+        """
+        # audit_logs table append-only verification
+        al_select = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.audit_logs', 'SELECT');")
+        al_insert = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.audit_logs', 'INSERT');")
+        al_update = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.audit_logs', 'UPDATE');")
+        al_delete = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.audit_logs', 'DELETE');")
+        al_truncate = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.audit_logs', 'TRUNCATE');")
+
+        assert al_select is True, "audit_logs must be readable by onsigning_app"
+        assert al_insert is True, "audit_logs must be insertable by onsigning_app"
+        assert al_update is False, "audit_logs must NOT be updatable by onsigning_app"
+        assert al_delete is False, "audit_logs must NOT be deletable by onsigning_app"
+        assert al_truncate is False, "audit_logs must NOT allow TRUNCATE by onsigning_app"
+
+        # users table verification
+        u_select = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.users', 'SELECT');")
+        u_insert = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.users', 'INSERT');")
+        u_update = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.users', 'UPDATE');")
+        u_delete = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.users', 'DELETE');")
+        u_truncate = await pg_app_conn.fetchval("SELECT has_table_privilege(current_user, 'public.users', 'TRUNCATE');")
+
+        assert u_select is True, "users must be readable by onsigning_app"
+        assert u_insert is True, "users must be insertable by onsigning_app"
+        assert u_update is True, "users must be updatable by onsigning_app"
+        assert u_delete is True, "users must be deletable by onsigning_app"
+        assert u_truncate is False, "users must NOT allow TRUNCATE by onsigning_app"
+
+    @pytest.mark.asyncio
     async def test_transaction_rollback_recovers_from_policy_violation(self, pg_app_conn, pg_admin_conn):
         """Proves that after an RLS violation puts transaction in ERROR state, ROLLBACK restores usability."""
         data = await _seed_tenants_and_users(pg_admin_conn)
