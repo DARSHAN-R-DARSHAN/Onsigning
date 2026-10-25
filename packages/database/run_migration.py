@@ -27,6 +27,7 @@ EXIT_MIGRATION_FAILURE = 2
 EXIT_VERIFICATION_FAILURE = 3
 
 MIGRATION_FILENAME = "0003_security_hardening.sql"
+APPROVED_MIGRATION_0003_SHA256 = "8ca03f97e7fe21b7ec208ef4b3835ba1af5ca2c9eef2f251a6ba4716b767ef28"
 
 
 def mask_dsn(dsn: Optional[str]) -> str:
@@ -273,6 +274,15 @@ def validate_preflight_config(
     except Exception as e:
         return False, f"Failed to read migration file: {sanitize_log(e)}", None
 
+    # Enforce exact approved SHA-256 digest before allowing connection or execution
+    if sha256 != APPROVED_MIGRATION_0003_SHA256:
+        return (
+            False,
+            f"Migration integrity check failed: SHA-256 digest '{sha256}' does not match "
+            f"approved digest '{APPROVED_MIGRATION_0003_SHA256}'. Execution rejected.",
+            None,
+        )
+
     allow_insecure_local_tls = (
         test_mode
         and env.get("ONSIGNING_ALLOW_INSECURE_LOCAL_TEST_TLS", "").lower() in ("true", "1", "yes")
@@ -395,10 +405,31 @@ async def execute_and_verify(
                 f"[MIGRATION FAILED] Execution error: {sanitize_log(exc)}{sqlstate_str}",
                 file=sys.stderr,
             )
-            print(
-                "[MIGRATION FAILED] Transaction automatically rolled back. Database remains in pre-migration state.",
-                file=sys.stderr,
+
+            # Distinguish confirmed server-side rollback from ambiguous connection/driver drops
+            # without inspecting exception text for "commit".
+            conn_closed = getattr(conn, "is_closed", lambda: True)()
+            is_connection_failure = (
+                conn_closed
+                or isinstance(exc, (ConnectionError, OSError, asyncio.TimeoutError))
+                or (hasattr(asyncpg, "InterfaceError") and isinstance(exc, asyncpg.InterfaceError))
+                or (hasattr(asyncpg, "ConnectionDoesNotExistError") and isinstance(exc, asyncpg.ConnectionDoesNotExistError))
             )
+
+            if is_connection_failure:
+                print(
+                    "[MIGRATION AMBIGUOUS] Database connection was lost, closed, or timed out during execution. "
+                    "Transaction outcome CANNOT be confirmed and may be AMBIGUOUS. "
+                    "The transaction may have committed before the connection dropped, or rollback may have occurred. "
+                    "Do NOT assume the database is unchanged. Inspect catalog manually before retrying.",
+                    file=sys.stderr,
+                )
+            else:
+                # Connection remained healthy and PostgreSQL rejected the transaction (e.g. prerequisite failure)
+                print(
+                    "[MIGRATION FAILED] Transaction rolled back by PostgreSQL. Pre-migration state confirmed.",
+                    file=sys.stderr,
+                )
             return EXIT_MIGRATION_FAILURE
 
         # ----------------------------------------------------------------------
@@ -433,7 +464,54 @@ async def execute_and_verify(
                             f"PostgREST role '{rolname}' has unexpected effective privilege '{priv.upper()}' on public.{table}."
                         )
 
-            # 2. Verify onsigning_app runtime privileges
+            # 2. Verify PUBLIC Pseudo-Role Table Privileges on public.users & public.audit_logs
+            # Note: PUBLIC is a PostgreSQL pseudo-role, NOT an entry in pg_roles.
+            # has_table_privilege('public', ...) evaluates effective privileges granted to PUBLIC.
+            # Verify all relevant privilege types: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER.
+            public_query = """
+            SELECT
+                t.tablename,
+                has_table_privilege('public', 'public.' || t.tablename, 'SELECT') AS can_select,
+                has_table_privilege('public', 'public.' || t.tablename, 'INSERT') AS can_insert,
+                has_table_privilege('public', 'public.' || t.tablename, 'UPDATE') AS can_update,
+                has_table_privilege('public', 'public.' || t.tablename, 'DELETE') AS can_delete,
+                has_table_privilege('public', 'public.' || t.tablename, 'TRUNCATE') AS can_truncate,
+                has_table_privilege('public', 'public.' || t.tablename, 'REFERENCES') AS can_references,
+                has_table_privilege('public', 'public.' || t.tablename, 'TRIGGER') AS can_trigger
+            FROM (VALUES ('users'), ('audit_logs')) AS t(tablename);
+            """
+            public_rows = await conn.fetch(public_query)
+            for pr in public_rows:
+                table = pr["tablename"]
+                for priv in ("select", "insert", "update", "delete", "truncate", "references", "trigger"):
+                    if pr[f"can_{priv}"]:
+                        verification_failures.append(
+                            f"PUBLIC pseudo-role has unexpected effective privilege '{priv.upper()}' on public.{table}."
+                        )
+
+            # Inspect pg_class.relacl directly to detect explicit grants to PUBLIC (=privileges/grantor)
+            relacl_query = """
+            SELECT
+                c.relname AS tablename,
+                c.relacl::text AS relacl_str
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+              AND c.relname IN ('users', 'audit_logs');
+            """
+            relacl_rows = await conn.fetch(relacl_query)
+            for rr in relacl_rows:
+                table = rr["tablename"]
+                relacl_str = rr["relacl_str"]
+                if relacl_str:
+                    # In PostgreSQL aclitem format, a grant to PUBLIC has an empty grantee before '=', e.g. "=r/postgres"
+                    match_pub = re.search(r"(?:^|[,{])=([^/]+)/", relacl_str)
+                    if match_pub:
+                        verification_failures.append(
+                            f"Table public.{table} relacl contains prohibited grant '{match_pub.group(1)}' to PUBLIC: {relacl_str}"
+                        )
+
+            # 3. Verify onsigning_app runtime privileges
             app_query = """
             SELECT
                 'users' AS tablename,
@@ -467,31 +545,41 @@ async def execute_and_verify(
                             "onsigning_app has forbidden UPDATE/DELETE/TRUNCATE on append-only public.audit_logs."
                         )
 
-            # 3. Verify Default Privileges for role postgres in schema public
-            # Distinguish absent default-ACL rows from explicit grants:
-            # - If no row exists, built-in system defaults apply (no grants to PostgREST roles).
-            # - If rows exist (e.g. objtype 'r' or 'S'), ensure defaclacl contains no grants to anon/authenticated/service_role.
+            # 4. Verify Default Privileges for role postgres in schema public
+            # Explicitly checks both table defaults ('r') and sequence defaults ('S').
+            # Confirms no privileges are granted to PUBLIC, anon, authenticated, or service_role.
+            # Handles null / absent ACLs correctly (null/absent defaults revert to PostgreSQL built-in creator-only).
             default_acl_query = """
             SELECT
                 defaclobjtype,
                 defaclacl::text AS defaclacl_str
             FROM pg_default_acl
             WHERE defaclrole = (SELECT oid FROM pg_roles WHERE rolname = 'postgres')
-              AND defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public');
+              AND defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+              AND defaclobjtype IN ('r', 'S');
             """
             default_acl_rows = await conn.fetch(default_acl_query)
             for drow in default_acl_rows:
                 objtype = drow["defaclobjtype"]
-                acl_str = drow["defaclacl_str"] or ""
-                # Parse aclitem format: grantee=privileges/grantor (e.g. anon=r/postgres)
-                # Ensure no PostgREST role appears as a grantee with privileges
-                match = re.search(r"(?:^|[,{])(anon|authenticated|service_role)=([^/]+)/", acl_str)
-                if match:
-                    rname = match.group(1)
-                    privs = match.group(2)
-                    verification_failures.append(
-                        f"Default ACL for role postgres in public (objtype '{objtype}') contains prohibited grant '{privs}' to '{rname}': {acl_str}"
-                    )
+                obj_desc = "tables" if objtype == "r" else ("sequences" if objtype == "S" else objtype)
+                acl_str = drow["defaclacl_str"]
+                if acl_str:
+                    # 4a. Check for prohibited grants to PostgREST roles (anon, authenticated, service_role)
+                    match_postgrest = re.search(r"(?:^|[,{])(anon|authenticated|service_role)=([^/]+)/", acl_str)
+                    if match_postgrest:
+                        rname = match_postgrest.group(1)
+                        privs = match_postgrest.group(2)
+                        verification_failures.append(
+                            f"Default ACL for role postgres in public ({obj_desc}) contains prohibited grant '{privs}' to '{rname}': {acl_str}"
+                        )
+
+                    # 4b. Check for prohibited grants to PUBLIC (=privileges/grantor)
+                    match_public = re.search(r"(?:^|[,{])=([^/]+)/", acl_str)
+                    if match_public:
+                        privs = match_public.group(1)
+                        verification_failures.append(
+                            f"Default ACL for role postgres in public ({obj_desc}) contains prohibited grant '{privs}' to PUBLIC: {acl_str}"
+                        )
         except Exception as ver_err:
             sanitized_err = sanitize_log(ver_err)
             print(

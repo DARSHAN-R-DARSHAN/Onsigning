@@ -19,6 +19,7 @@ from packages.database.run_migration import (
     EXIT_PREFLIGHT_FAILURE,
     EXIT_MIGRATION_FAILURE,
     EXIT_VERIFICATION_FAILURE,
+    APPROVED_MIGRATION_0003_SHA256,
     mask_dsn,
     sanitize_log,
     parse_args,
@@ -185,6 +186,46 @@ def test_preflight_success_with_valid_config(valid_args, valid_env):
     assert config["trusted_project_ref"] == "xyzstgproject"
     assert "0003_security_hardening.sql" in str(config["migration_file"])
     assert len(config["migration_sha256"]) == 64
+    assert config["migration_sha256"] == APPROVED_MIGRATION_0003_SHA256
+
+
+def test_preflight_hash_mismatch_fails_closed(valid_args, valid_env, monkeypatch):
+    """Proves that altered or substituted migration bytes are rejected before DB connection."""
+    from pathlib import Path
+    real_read_bytes = Path.read_bytes
+
+    def fake_read_bytes(self):
+        if self.name == "0003_security_hardening.sql":
+            return b"-- tampered migration bytes\nSELECT 1;"
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+    ok, msg, config = validate_preflight_config(valid_args, valid_env)
+    assert not ok
+    assert "Migration integrity check failed: SHA-256 digest" in msg
+    assert APPROVED_MIGRATION_0003_SHA256 in msg
+    assert config is None
+
+
+def test_main_hash_mismatch_returns_exit_preflight_failure(valid_args, valid_env, monkeypatch):
+    """Proves main() returns EXIT_PREFLIGHT_FAILURE immediately on hash mismatch without connecting."""
+    from pathlib import Path
+    real_read_bytes = Path.read_bytes
+
+    def fake_read_bytes(self):
+        if self.name == "0003_security_hardening.sql":
+            return b"-- altered bytes\n"
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+    with patch.dict(os.environ, valid_env, clear=True):
+        args_list = [
+            "--target", "staging",
+            "--confirm-staging",
+            "--project-ref", valid_args.project_ref,
+        ]
+        exit_code = main(args_list)
+        assert exit_code == EXIT_PREFLIGHT_FAILURE
 
 
 # ==============================================================================
@@ -245,6 +286,7 @@ async def test_migration_execution_rolls_back_on_sql_error(valid_args, valid_env
     assert ok
 
     mock_conn = AsyncMock()
+    mock_conn.is_closed = MagicMock(return_value=False)
     mock_conn.fetchrow.return_value = {
         "db_name": "postgres",
         "user_name": "postgres",
@@ -261,13 +303,78 @@ async def test_migration_execution_rolls_back_on_sql_error(valid_args, valid_env
     assert exit_code == EXIT_MIGRATION_FAILURE
 
     captured = capsys.readouterr()
-    assert "Transaction automatically rolled back" in captured.err
-    assert "Database remains in pre-migration state" in captured.err
+    assert "Transaction rolled back by PostgreSQL. Pre-migration state confirmed." in captured.err
+
+
+@pytest.mark.asyncio
+async def test_migration_execution_ambiguous_on_connection_drop(valid_args, valid_env, capsys):
+    """Proves that connection loss during execution/commit flags ambiguous outcome rather than confirming rollback."""
+    ok, msg, config = validate_preflight_config(valid_args, valid_env)
+    assert ok
+
+    mock_conn = AsyncMock()
+    mock_conn.is_closed = MagicMock(return_value=True)
+    mock_conn.fetchrow.return_value = {
+        "db_name": "postgres",
+        "user_name": "postgres",
+        "server_ip": "10.0.0.1",
+    }
+
+    mock_tx = MockAsyncTransaction()
+    mock_conn.transaction = MagicMock(return_value=mock_tx)
+    mock_conn.execute.side_effect = ConnectionResetError("Connection reset by peer during commit")
+
+    exit_code = await execute_and_verify(config, conn_override=mock_conn)
+    assert exit_code == EXIT_MIGRATION_FAILURE
+
+    captured = capsys.readouterr()
+    assert "[MIGRATION AMBIGUOUS] Database connection was lost, closed, or timed out during execution." in captured.err
+    assert "Transaction outcome CANNOT be confirmed and may be AMBIGUOUS." in captured.err
+    assert "Do NOT assume the database is unchanged." in captured.err
+    assert "Pre-migration state confirmed" not in captured.err
 
 
 # ==============================================================================
 # 4. POST-COMMIT VERIFICATION TESTS
 # ==============================================================================
+
+def make_clean_public_rows():
+    return [
+        {
+            "tablename": "users",
+            "can_select": False,
+            "can_insert": False,
+            "can_update": False,
+            "can_delete": False,
+            "can_truncate": False,
+            "can_references": False,
+            "can_trigger": False,
+        },
+        {
+            "tablename": "audit_logs",
+            "can_select": False,
+            "can_insert": False,
+            "can_update": False,
+            "can_delete": False,
+            "can_truncate": False,
+            "can_references": False,
+            "can_trigger": False,
+        },
+    ]
+
+
+def make_clean_relacl_rows():
+    return [
+        {
+            "tablename": "users",
+            "relacl_str": "{postgres=arwdDxt/postgres,onsigning_app=arwd/postgres}",
+        },
+        {
+            "tablename": "audit_logs",
+            "relacl_str": "{postgres=arwdDxt/postgres,onsigning_app=ar/postgres}",
+        },
+    ]
+
 
 @pytest.mark.asyncio
 async def test_post_commit_verification_failure_flags_committed_status(valid_args, valid_env, capsys):
@@ -299,7 +406,11 @@ async def test_post_commit_verification_failure_flags_committed_status(valid_arg
                 "can_truncate": False,
             }
         ],
-        # Query 2: onsigning_app roles - valid
+        # Query 2: PUBLIC table privileges - clean
+        make_clean_public_rows(),
+        # Query 3: relacl - clean
+        make_clean_relacl_rows(),
+        # Query 4: onsigning_app roles - valid
         [
             {
                 "tablename": "users",
@@ -318,7 +429,7 @@ async def test_post_commit_verification_failure_flags_committed_status(valid_arg
                 "can_truncate": False,
             },
         ],
-        # Query 3: default ACLs - empty
+        # Query 5: default ACLs - empty
         [],
     ]
 
@@ -370,7 +481,11 @@ async def test_successful_execution_and_verification_workflow(valid_args, valid_
                 "can_truncate": False,
             },
         ],
-        # Query 2: onsigning_app roles - exact expected privileges
+        # Query 2: PUBLIC pseudo-role - all false
+        make_clean_public_rows(),
+        # Query 3: pg_class.relacl - clean
+        make_clean_relacl_rows(),
+        # Query 4: onsigning_app roles - exact expected privileges
         [
             {
                 "tablename": "users",
@@ -389,7 +504,7 @@ async def test_successful_execution_and_verification_workflow(valid_args, valid_
                 "can_truncate": False,
             },
         ],
-        # Query 3: default ACLs - no PostgREST grants
+        # Query 5: default ACLs - no PostgREST or PUBLIC grants
         [
             {
                 "defaclobjtype": "r",
@@ -468,7 +583,11 @@ async def test_post_commit_default_acl_prohibited_grant_detected(valid_args, val
     mock_conn.fetch.side_effect = [
         # Query 1: PostgREST roles - all false
         [],
-        # Query 2: onsigning_app roles - valid
+        # Query 2: PUBLIC table privileges - clean
+        make_clean_public_rows(),
+        # Query 3: relacl - clean
+        make_clean_relacl_rows(),
+        # Query 4: onsigning_app roles - valid
         [
             {
                 "tablename": "users",
@@ -487,7 +606,7 @@ async def test_post_commit_default_acl_prohibited_grant_detected(valid_args, val
                 "can_truncate": False,
             },
         ],
-        # Query 3: default ACL contains PROHIBITED grant: anon=r/postgres
+        # Query 5: default ACL contains PROHIBITED grant: anon=r/postgres
         [
             {
                 "defaclobjtype": "r",
@@ -527,7 +646,11 @@ async def test_post_commit_default_acl_absent_rows_permitted(valid_args, valid_e
     mock_conn.fetch.side_effect = [
         # Query 1: PostgREST roles - all false
         [],
-        # Query 2: onsigning_app roles - valid
+        # Query 2: PUBLIC table privileges - clean
+        make_clean_public_rows(),
+        # Query 3: relacl - clean
+        make_clean_relacl_rows(),
+        # Query 4: onsigning_app roles - valid
         [
             {
                 "tablename": "users",
@@ -546,7 +669,7 @@ async def test_post_commit_default_acl_absent_rows_permitted(valid_args, valid_e
                 "can_truncate": False,
             },
         ],
-        # Query 3: default ACL rows absent (empty list) -> permitted!
+        # Query 5: default ACL rows absent (empty list) -> permitted!
         [],
     ]
 
@@ -555,6 +678,250 @@ async def test_post_commit_default_acl_absent_rows_permitted(valid_args, valid_e
 
     captured = capsys.readouterr()
     assert "[VERIFICATION SUCCESS] All post-commit security invariants verified." in captured.out
+
+
+@pytest.mark.asyncio
+async def test_post_commit_public_table_privilege_detected_as_failure(valid_args, valid_env, capsys):
+    """Proves that unexpected table privileges granted to PUBLIC pseudo-role are flagged as failure."""
+    ok, msg, config = validate_preflight_config(valid_args, valid_env)
+    assert ok
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow.return_value = {
+        "db_name": "postgres",
+        "user_name": "postgres",
+        "server_ip": "10.0.0.1",
+    }
+
+    mock_tx = MockAsyncTransaction()
+    mock_conn.transaction = MagicMock(return_value=mock_tx)
+    mock_conn.execute.return_value = "DO"
+
+    # PUBLIC has unexpected SELECT on users
+    public_rows_with_violation = make_clean_public_rows()
+    public_rows_with_violation[0]["can_select"] = True
+
+    mock_conn.fetch.side_effect = [
+        # Query 1: PostgREST roles - clean
+        [],
+        # Query 2: PUBLIC table privileges - VIOLATION!
+        public_rows_with_violation,
+        # Query 3: relacl - clean
+        make_clean_relacl_rows(),
+        # Query 4: onsigning_app roles - valid
+        [
+            {
+                "tablename": "users",
+                "can_select": True,
+                "can_insert": True,
+                "can_update": True,
+                "can_delete": True,
+                "can_truncate": False,
+            },
+            {
+                "tablename": "audit_logs",
+                "can_select": True,
+                "can_insert": True,
+                "can_update": False,
+                "can_delete": False,
+                "can_truncate": False,
+            },
+        ],
+        # Query 5: default ACLs - clean
+        [],
+    ]
+
+    exit_code = await execute_and_verify(config, conn_override=mock_conn)
+    assert exit_code == EXIT_VERIFICATION_FAILURE
+
+    captured = capsys.readouterr()
+    assert "[CRITICAL ALERT] Post-commit security verification FAILED!" in captured.err
+    assert "PUBLIC pseudo-role has unexpected effective privilege 'SELECT' on public.users." in captured.err
+    assert "The migration transaction has ALREADY COMMITTED and was NOT rolled back" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_post_commit_public_relacl_grant_detected_as_failure(valid_args, valid_env, capsys):
+    """Proves that prohibited grants to PUBLIC in pg_class.relacl are flagged as verification failure."""
+    ok, msg, config = validate_preflight_config(valid_args, valid_env)
+    assert ok
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow.return_value = {
+        "db_name": "postgres",
+        "user_name": "postgres",
+        "server_ip": "10.0.0.1",
+    }
+
+    mock_tx = MockAsyncTransaction()
+    mock_conn.transaction = MagicMock(return_value=mock_tx)
+    mock_conn.execute.return_value = "DO"
+
+    mock_conn.fetch.side_effect = [
+        # Query 1: PostgREST roles - clean
+        [],
+        # Query 2: PUBLIC table privileges - clean
+        make_clean_public_rows(),
+        # Query 3: relacl contains prohibited grant to PUBLIC (=r/postgres on users)
+        [
+            {
+                "tablename": "users",
+                "relacl_str": "{postgres=arwdDxt/postgres,=r/postgres}",
+            },
+            {
+                "tablename": "audit_logs",
+                "relacl_str": "{postgres=arwdDxt/postgres}",
+            },
+        ],
+        # Query 4: onsigning_app roles - valid
+        [
+            {
+                "tablename": "users",
+                "can_select": True,
+                "can_insert": True,
+                "can_update": True,
+                "can_delete": True,
+                "can_truncate": False,
+            },
+            {
+                "tablename": "audit_logs",
+                "can_select": True,
+                "can_insert": True,
+                "can_update": False,
+                "can_delete": False,
+                "can_truncate": False,
+            },
+        ],
+        # Query 5: default ACLs - clean
+        [],
+    ]
+
+    exit_code = await execute_and_verify(config, conn_override=mock_conn)
+    assert exit_code == EXIT_VERIFICATION_FAILURE
+
+    captured = capsys.readouterr()
+    assert "[CRITICAL ALERT] Post-commit security verification FAILED!" in captured.err
+    assert "Table public.users relacl contains prohibited grant 'r' to PUBLIC" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_post_commit_public_default_acl_grant_detected_as_failure(valid_args, valid_env, capsys):
+    """Proves that prohibited grants to PUBLIC in pg_default_acl are flagged as verification failure."""
+    ok, msg, config = validate_preflight_config(valid_args, valid_env)
+    assert ok
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow.return_value = {
+        "db_name": "postgres",
+        "user_name": "postgres",
+        "server_ip": "10.0.0.1",
+    }
+
+    mock_tx = MockAsyncTransaction()
+    mock_conn.transaction = MagicMock(return_value=mock_tx)
+    mock_conn.execute.return_value = "DO"
+
+    mock_conn.fetch.side_effect = [
+        # Query 1: PostgREST roles - clean
+        [],
+        # Query 2: PUBLIC table privileges - clean
+        make_clean_public_rows(),
+        # Query 3: relacl - clean
+        make_clean_relacl_rows(),
+        # Query 4: onsigning_app roles - valid
+        [
+            {
+                "tablename": "users",
+                "can_select": True,
+                "can_insert": True,
+                "can_update": True,
+                "can_delete": True,
+                "can_truncate": False,
+            },
+            {
+                "tablename": "audit_logs",
+                "can_select": True,
+                "can_insert": True,
+                "can_update": False,
+                "can_delete": False,
+                "can_truncate": False,
+            },
+        ],
+        # Query 5: default ACL contains prohibited grant to PUBLIC on tables
+        [
+            {
+                "defaclobjtype": "r",
+                "defaclacl_str": "{postgres=arwdDxt/postgres,=r/postgres}",
+            }
+        ],
+    ]
+
+    exit_code = await execute_and_verify(config, conn_override=mock_conn)
+    assert exit_code == EXIT_VERIFICATION_FAILURE
+
+    captured = capsys.readouterr()
+    assert "[CRITICAL ALERT] Post-commit security verification FAILED!" in captured.err
+    assert "Default ACL for role postgres in public (tables) contains prohibited grant 'r' to PUBLIC" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sequence_default_acl_postgrest_grant_detected_as_failure(valid_args, valid_env, capsys):
+    """Proves that prohibited grants on sequences in pg_default_acl are explicitly caught and flagged."""
+    ok, msg, config = validate_preflight_config(valid_args, valid_env)
+    assert ok
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow.return_value = {
+        "db_name": "postgres",
+        "user_name": "postgres",
+        "server_ip": "10.0.0.1",
+    }
+
+    mock_tx = MockAsyncTransaction()
+    mock_conn.transaction = MagicMock(return_value=mock_tx)
+    mock_conn.execute.return_value = "DO"
+
+    mock_conn.fetch.side_effect = [
+        # Query 1: PostgREST roles - clean
+        [],
+        # Query 2: PUBLIC table privileges - clean
+        make_clean_public_rows(),
+        # Query 3: relacl - clean
+        make_clean_relacl_rows(),
+        # Query 4: onsigning_app roles - valid
+        [
+            {
+                "tablename": "users",
+                "can_select": True,
+                "can_insert": True,
+                "can_update": True,
+                "can_delete": True,
+                "can_truncate": False,
+            },
+            {
+                "tablename": "audit_logs",
+                "can_select": True,
+                "can_insert": True,
+                "can_update": False,
+                "can_delete": False,
+                "can_truncate": False,
+            },
+        ],
+        # Query 5: default ACL contains prohibited grant to authenticated on sequences
+        [
+            {
+                "defaclobjtype": "S",
+                "defaclacl_str": "{postgres=rwU/postgres,authenticated=r/postgres}",
+            }
+        ],
+    ]
+
+    exit_code = await execute_and_verify(config, conn_override=mock_conn)
+    assert exit_code == EXIT_VERIFICATION_FAILURE
+
+    captured = capsys.readouterr()
+    assert "[CRITICAL ALERT] Post-commit security verification FAILED!" in captured.err
+    assert "Default ACL for role postgres in public (sequences) contains prohibited grant 'r' to 'authenticated'" in captured.err
 
 
 def test_preflight_insecure_local_tls_rejected_for_non_localhost(valid_args, valid_env):
