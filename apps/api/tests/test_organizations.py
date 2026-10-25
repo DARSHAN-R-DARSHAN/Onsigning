@@ -46,6 +46,7 @@ async def test_expired_token_rejected(client: AsyncClient):
         "sub": str(uuid.uuid4()),
         "email": "expired@example.com",
         "aud": settings.SUPABASE_AUDIENCE,
+        "iss": settings.supabase_issuer,
         "exp": int(time.time()) - 3600,
         "iat": int(time.time()) - 7200,
     }

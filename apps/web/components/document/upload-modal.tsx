@@ -1,9 +1,12 @@
 "use client";
 
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { X, UploadCloud, AlertCircle, CheckCircle2 } from "lucide-react";
 import { formatBytes } from "@/lib/utils";
+import { useAuth } from "@/lib/auth-context";
+import { useOrg } from "@/lib/org-context";
+import { apiClient, ApiError } from "@/lib/api";
 
 interface UploadModalProps {
   isOpen: boolean;
@@ -12,13 +15,33 @@ interface UploadModalProps {
 }
 
 export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
+  const { token } = useAuth();
+  const { selectedOrgId, selectedOrg } = useOrg();
+
   const [dragActive, setDragActive] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [hierarchyType, setHierarchyType] = useState("MASTER_SERVICES_AGREEMENT");
+  const [hierarchyType, setHierarchyType] = useState("MSA");
   const [autoAudit, setAutoAudit] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const resetState = useCallback(() => {
+    setSelectedFile(null);
+    setError(null);
+    setDragActive(false);
+    setHierarchyType("MSA");
+    setAutoAudit(true);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }, []);
+
+  const handleClose = useCallback(() => {
+    if (isUploading) return;
+    resetState();
+    onClose();
+  }, [isUploading, resetState, onClose]);
 
   if (!isOpen) return null;
 
@@ -72,6 +95,16 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
   const handleUpload = async () => {
     if (!selectedFile) return;
 
+    if (!token) {
+      setError("You must be signed in to upload an agreement.");
+      return;
+    }
+
+    if (!selectedOrgId) {
+      setError("Please select an organization workspace before uploading an agreement.");
+      return;
+    }
+
     try {
       setIsUploading(true);
       setError(null);
@@ -81,22 +114,25 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
       formData.append("hierarchy_type", hierarchyType);
       formData.append("auto_audit", autoAudit ? "true" : "false");
 
-      // In real deployment, auth headers are injected via Supabase session
-      const res = await fetch("/api/v1/documents/upload", {
-        method: "POST",
-        body: formData,
-      });
+      const response = await apiClient.postFormData<{ id: string }>(
+        "/api/v1/documents/upload",
+        formData,
+        {
+          token,
+          organizationId: selectedOrgId,
+        }
+      );
 
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.message || `Upload failed with status ${res.status}`);
-      }
-
-      const data = await res.json();
-      onSuccess(data.id);
+      resetState();
+      onSuccess(response.id);
       onClose();
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Failed to upload document. Please try again.";
+      const message =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+          ? err.message
+          : "Failed to upload document. Please try again.";
       setError(message);
     } finally {
       setIsUploading(false);
@@ -104,17 +140,25 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 animate-in fade-in duration-150">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="upload-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 animate-in fade-in duration-150"
+    >
       <div className="bg-white rounded-lg shadow-xl max-w-lg w-full border border-border overflow-hidden">
         {/* Modal Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border bg-canvas">
           <div className="flex items-center space-x-2">
             <UploadCloud className="w-5 h-5 text-primary" />
-            <h3 className="font-semibold text-navy text-base">Upload Agreement</h3>
+            <h3 id="upload-modal-title" className="font-semibold text-navy text-base">
+              Upload Agreement
+            </h3>
           </div>
           <button
-            onClick={onClose}
-            className="text-text-secondary hover:text-navy rounded p-1 hover:bg-blue-100 transition"
+            onClick={handleClose}
+            disabled={isUploading}
+            className="text-text-secondary hover:text-navy rounded p-1 hover:bg-blue-100 transition disabled:opacity-50"
             aria-label="Close upload dialog"
           >
             <X className="w-4 h-4" />
@@ -123,20 +167,36 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
 
         {/* Modal Body */}
         <div className="p-6 space-y-5">
+          {/* Workspace indicator */}
+          {selectedOrg ? (
+            <p className="text-xs text-text-secondary">
+              Uploading to workspace: <span className="font-semibold text-navy">{selectedOrg.name}</span>
+            </p>
+          ) : (
+            <div className="flex items-start rounded-md bg-amber-50 border border-amber-200 p-3 text-xs text-amber-800">
+              <AlertCircle className="w-4 h-4 text-amber-600 mr-2 flex-shrink-0 mt-0.5" />
+              <span>No workspace selected. Please select an organization workspace before uploading.</span>
+            </div>
+          )}
+
           {/* Dropzone */}
           <div
             onDragEnter={handleDrag}
             onDragLeave={handleDrag}
             onDragOver={handleDrag}
             onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => {
+              if (!isUploading) {
+                fileInputRef.current?.click();
+              }
+            }}
             className={`border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-colors ${
               dragActive
                 ? "border-primary bg-blue-50/70"
                 : selectedFile
                 ? "border-emerald-400 bg-emerald-50/30"
                 : "border-border hover:border-blue-300 hover:bg-canvas"
-            }`}
+            } ${isUploading ? "pointer-events-none opacity-60" : ""}`}
           >
             <input
               ref={fileInputRef}
@@ -157,11 +217,15 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
                 <p className="text-xs text-text-secondary mt-1">{formatBytes(selectedFile.size)}</p>
                 <button
                   type="button"
+                  disabled={isUploading}
                   onClick={(e) => {
                     e.stopPropagation();
                     setSelectedFile(null);
+                    if (fileInputRef.current) {
+                      fileInputRef.current.value = "";
+                    }
                   }}
-                  className="mt-2 text-xs text-primary hover:underline"
+                  className="mt-2 text-xs text-primary hover:underline disabled:opacity-50"
                 >
                   Change file
                 </button>
@@ -190,18 +254,26 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
           {/* Form Options */}
           <div className="space-y-4">
             <div>
-              <label className="block text-xs font-semibold text-navy uppercase tracking-wider mb-1.5">
+              <label
+                htmlFor="hierarchy-type-select"
+                className="block text-xs font-semibold text-navy uppercase tracking-wider mb-1.5"
+              >
                 Document Hierarchy Type
               </label>
               <select
+                id="hierarchy-type-select"
                 value={hierarchyType}
                 onChange={(e) => setHierarchyType(e.target.value)}
-                className="w-full text-sm rounded-md border border-border p-2.5 bg-white text-navy focus:border-primary focus:ring-1 focus:ring-primary outline-none"
+                disabled={isUploading}
+                className="w-full text-sm rounded-md border border-border p-2.5 bg-white text-navy focus:border-primary focus:ring-1 focus:ring-primary outline-none disabled:opacity-50"
               >
-                <option value="MASTER_SERVICES_AGREEMENT">Master Services Agreement (MSA)</option>
-                <option value="AMENDMENT">Amendment / Addendum</option>
-                <option value="STATEMENT_OF_WORK">Statement of Work (SOW)</option>
+                <option value="MSA">Master Services Agreement (MSA)</option>
+                <option value="SOW">Statement of Work (SOW)</option>
+                <option value="AMENDMENT">Amendment / Modification</option>
+                <option value="ADDENDUM_DPA">Addendum / DPA</option>
+                <option value="SLA">Service Level Agreement (SLA)</option>
                 <option value="ORDER_FORM">Order Form / Schedule</option>
+                <option value="INSURANCE_COI">Certificate of Insurance (COI)</option>
                 <option value="OTHER">Other Standalone Agreement</option>
               </select>
             </div>
@@ -212,7 +284,8 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
                 type="checkbox"
                 checked={autoAudit}
                 onChange={(e) => setAutoAudit(e.target.checked)}
-                className="rounded border-border text-primary focus:ring-primary h-4 w-4"
+                disabled={isUploading}
+                className="rounded border-border text-primary focus:ring-primary h-4 w-4 disabled:opacity-50"
               />
               <label htmlFor="auto-audit" className="text-xs text-navy font-medium cursor-pointer">
                 Automatically execute Risk Playbook audit upon upload
@@ -223,14 +296,14 @@ export function UploadModal({ isOpen, onClose, onSuccess }: UploadModalProps) {
 
         {/* Modal Footer */}
         <div className="flex items-center justify-end space-x-2.5 px-6 py-4 bg-canvas border-t border-border">
-          <Button variant="secondary" size="md" onClick={onClose} disabled={isUploading}>
+          <Button variant="secondary" size="md" onClick={handleClose} disabled={isUploading}>
             Cancel
           </Button>
           <Button
             variant="primary"
             size="md"
             onClick={handleUpload}
-            disabled={!selectedFile || isUploading}
+            disabled={!selectedFile || isUploading || !selectedOrgId}
             isLoading={isUploading}
           >
             {isUploading ? "Uploading..." : "Upload & Analyze"}

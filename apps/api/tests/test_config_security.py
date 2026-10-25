@@ -168,7 +168,7 @@ class TestProductionConfigSecurity:
     def test_development_and_test_allow_mock_defaults(self):
         """Development and test environments must continue to allow mock defaults without error."""
         for dev_env in ("development", "test", "dev", "local", ""):
-            settings = Settings(ENVIRONMENT=dev_env)
+            settings = Settings(_env_file=None, ENVIRONMENT=dev_env)
             assert settings.SUPABASE_JWT_SECRET == DEV_MOCK_JWT_SECRET
             assert "sqlite" in settings.DATABASE_URL
 

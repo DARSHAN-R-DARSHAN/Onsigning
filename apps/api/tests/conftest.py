@@ -3,11 +3,17 @@ Pytest configuration and fixtures for Onsigning API tests.
 Provides isolated in-memory test database, test tenants, and authenticated HTTP clients.
 """
 
+import os
 import asyncio
 import uuid
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+
+# Ensure test suite runs in isolated test environment with in-memory SQLite
+os.environ.setdefault("ENVIRONMENT", "test")
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.pool import StaticPool
 

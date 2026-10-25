@@ -39,6 +39,35 @@ class Settings(BaseSettings):
     )
     SUPABASE_JWT_ALGORITHM: str = Field(default="HS256")
     SUPABASE_AUDIENCE: str = Field(default="authenticated")
+    SUPABASE_JWKS_URL: Optional[str] = Field(
+        default=None,
+        description="Optional custom JWKS endpoint URL; defaults to {SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+    )
+    SUPABASE_JWKS_CACHE_TTL_SECONDS: int = Field(
+        default=3600,
+        description="Cache TTL in seconds for fetched JWKS keys (default 3600s / 1 hour)"
+    )
+    SUPABASE_ALLOWED_JWT_ALGORITHMS: str = Field(
+        default="ES256,HS256",
+        description="Comma-separated allowlist of permitted JWT verification algorithms"
+    )
+
+    @property
+    def supabase_issuer(self) -> str:
+        """Expected Supabase Auth token issuer URL."""
+        return f"{self.SUPABASE_URL.rstrip('/')}/auth/v1"
+
+    @property
+    def supabase_jwks_url(self) -> str:
+        """Resolved JWKS endpoint URL for asymmetric ES256 key verification."""
+        if self.SUPABASE_JWKS_URL and self.SUPABASE_JWKS_URL.strip():
+            return self.SUPABASE_JWKS_URL.strip()
+        return f"{self.SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json"
+
+    @property
+    def allowed_jwt_algorithms(self) -> list[str]:
+        """Parsed uppercase list of approved JWT signing algorithms."""
+        return [a.strip().upper() for a in self.SUPABASE_ALLOWED_JWT_ALGORITHMS.split(",") if a.strip()]
 
     # Operational Baseline Limits (Approved)
     MAX_UPLOAD_SIZE_BYTES: int = Field(
@@ -133,6 +162,14 @@ class Settings(BaseSettings):
                     f"Security invariant violated: Unsupported or insecure JWT algorithm: '{algo}' "
                     f"in environment '{self.ENVIRONMENT}'."
                 )
+
+            # 3b. Verify allowed algorithm allowlist does not permit insecure algorithms
+            for a in self.allowed_jwt_algorithms:
+                if a in ("NONE", "NULL", "PLAIN", "MD5", "DES"):
+                    raise ValueError(
+                        f"Security invariant violated: Insecure algorithm '{a}' in "
+                        f"SUPABASE_ALLOWED_JWT_ALGORITHMS is strictly prohibited."
+                    )
 
             # 4. Require PostgreSQL (reject SQLite) in production-like environments
             db_url = (self.DATABASE_URL or "").strip().lower()
