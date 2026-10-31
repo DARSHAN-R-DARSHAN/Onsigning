@@ -19,7 +19,8 @@ def test_migration_chain_ordering_and_discovery():
     expected_files = [
         "0001_mvp_schema.sql",
         "0002_runtime_grants.sql",
-        "0003_security_hardening.sql"
+        "0003_security_hardening.sql",
+        "0004_postgrest_privilege_hardening.sql",
     ]
     assert sql_files == expected_files, f"Unexpected migration sequence: {sql_files}"
 
