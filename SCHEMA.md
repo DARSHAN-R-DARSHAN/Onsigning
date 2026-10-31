@@ -1,7 +1,7 @@
 # Onsigning — Canonical Data Model
-**Version:** 1.0 · **Status:** Logical schema baseline; SQL migration must be validated before execution.
+**Version:** 1.1 · **Status:** Implemented & Hardened (Migrations 0001–0004 Verified) · **Updated:** 2026-10-31
 
-> This document defines the canonical entities, relationships, enums and integrity rules. It is not a claim that a migration has been run successfully. Keep actual DDL in `packages/database/migrations/0001_mvp_schema.sql` and test it against PostgreSQL 16+.
+> This document defines the canonical entities, relationships, enums, integrity rules, and database security baseline. Implemented via forward-only migrations `0001_mvp_schema.sql` through `0004_postgrest_privilege_hardening.sql` and verified on PostgreSQL 16+ (Supabase Staging).
 
 ## 1. Database requirements
 PostgreSQL 16+, `uuid-ossp`, `pg_trgm`, and `vector` (pgvector 0.8+). Use UUID primary keys, UTC `TIMESTAMPTZ` for event timestamps, `DATE` for contract calendar dates, `JSONB` only for flexible payloads, and integer minor units for money. Every tenant-owned table carries `organization_id`.
@@ -82,12 +82,10 @@ doc_error_category:
 - Workspace boundary for all tenant-owned data.
 
 ### `users`
-- `id UUID PK`, `email UNIQUE`, `full_name`, `created_at`.
-- Global identity. Access to a workspace comes only from membership.
-- **Pending Decision (AUD-002):** The authentication provider architecture is undecided pending owner approval. Minimal schema implications:
-  - *Option A (Native FastAPI Auth):* Add `password_hash VARCHAR(255) NOT NULL`, `email_verified BOOL DEFAULT FALSE`, `password_reset_token VARCHAR(255) NULL`.
-  - *Option B (Managed IdP, e.g. Supabase Auth / Clerk / Auth0):* Add `external_auth_id VARCHAR(255) UNIQUE NOT NULL`, `auth_provider VARCHAR(50) NOT NULL`.
-  No speculative credential columns are added to this baseline until the decision is formally approved.
+- `id UUID PK DEFAULT gen_random_uuid()`, `email VARCHAR(255) UNIQUE NOT NULL`, `full_name VARCHAR(255) NULL`, `external_auth_id VARCHAR(255) UNIQUE NULL`, `auth_provider VARCHAR(50) NOT NULL DEFAULT 'supabase'`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`.
+- Global identity mapped to managed IdP (Supabase Auth). Access to a workspace comes only from `organization_memberships`.
+- **Authentication Architecture (AUD-002 Implemented):** Option B (Managed IdP with Supabase Auth) is implemented. The browser authenticates via Supabase Auth; FastAPI cryptographically validates bearer JWTs via Supabase JWKS (ES256) and maps the JWT `sub` claim to `users.id` and `users.external_auth_id`. Just-in-time user provisioning populates `email` and `full_name` from token metadata on first login. No credentials or password hashes reside in PostgreSQL.
+- **RLS Boundary Exception:** RLS is intentionally disabled on `users`. Global user identity resolution occurs in FastAPI prior to workspace selection (before `app.current_organization_id` exists). Access to user records is strictly guarded server-side by FastAPI authorization dependencies (`get_current_user`). Tenant isolation begins at `organization_memberships`.
 
 ### `organization_memberships`
 - `id UUID PK`, `organization_id`, `user_id`, `role user_role`, `created_at`.
@@ -167,15 +165,21 @@ doc_error_category:
 ## 4. Mandatory database integrity rules
 1. Every tenant-owned table has `organization_id NOT NULL` and `UNIQUE(organization_id, id)` where referenced by composite FK.
 2. Tenant-owned child-to-parent relationships use composite foreign keys including `organization_id`.
-3. Enable and `FORCE` RLS on all tenant-sensitive tables.
-4. Runtime role `onsigning_app` must be `NOBYPASSRLS`; migration role is separate.
-5. Use transaction-local `app.current_user_id` and `app.current_organization_id`; never rely on connection-persistent settings.
-6. Citation checks enforce that verified means exact or strict normalized match; approximate similarity is never verification.
-7. `audit_logs` is append-only for the runtime role.
-8. `obligation_notifications` uniqueness prevents duplicate logical reminders.
-9. A playbook version used by an audit is immutable and traceable.
-10. All `ON DELETE SET NULL` actions on composite FKs must explicitly null only the nullable child FK column—not `organization_id` (e.g. `ON DELETE SET NULL (contract_family_id)` or `ON DELETE SET NULL (extracted_clause_id)`).
-11. Preservation of reviewed audit findings (AUD-015): Re-running document parsing or AI extraction may delete or replace unreviewed AI-generated records (`review_status = AI_EVALUATED`), but must preserve any `extracted_clauses` linked to human-reviewed `risk_alerts` (`review_status IN (HUMAN_CONFIRMED, HUMAN_OVERRIDDEN, DISMISSED_FALSE_POSITIVE)`) or confirmed supersessions (`supersession_state = CONFIRMED_SUPERSEDED`). `risk_alerts.evidence_payload` retains an immutable copy of the source citation and page range so audit trails remain intact indefinitely.
+3. Enable and `FORCE` RLS on all 16 tenant-sensitive tables. The `users` table intentionally has RLS disabled for pre-tenant authentication and identity resolution.
+4. Runtime role `onsigning_app` must be `NOBYPASSRLS` and `NOSUPERUSER`; migration role is separate (`postgres` in Supabase cloud deployments, `onsigning_admin` in standalone CI).
+5. Schema `public` permissions: `onsigning_app` possesses `USAGE` on schema `public`; `CREATE` is revoked, preventing runtime DDL execution.
+6. Zero-trust PostgREST boundary: Roles `anon`, `authenticated`, `service_role`, and `PUBLIC` have zero privileges (`REVOKE ALL`) on all 17 application tables. While `service_role` retains its cluster-level `BYPASSRLS` attribute, revoking its effective privileges on the 17 audited application tables blocks direct access through those audited table-permission paths. Direct PostgREST API access cannot access application data.
+7. Application role least-privilege grants: `onsigning_app` possesses `SELECT, INSERT, UPDATE, DELETE` on 16 application tables (`TRUNCATE` is withheld).
+8. Append-only audit logs: `audit_logs` is append-only for `onsigning_app` (`SELECT, INSERT` only; `UPDATE, DELETE, TRUNCATE` are withheld from `onsigning_app` and `PUBLIC`).
+9. Sequence access: `onsigning_app` possesses `USAGE, SELECT` on all sequences in schema `public`.
+10. Use transaction-local `app.current_user_id` and `app.current_organization_id`; never rely on connection-persistent settings.
+11. Citation checks enforce that verified means exact or strict normalized match; approximate similarity is never verification.
+12. `obligation_notifications` uniqueness `(organization_id, obligation_id, lead_days_threshold, delivery_channel)` prevents duplicate logical reminders.
+13. A playbook version used by an audit is immutable and traceable.
+14. All `ON DELETE SET NULL` actions on composite FKs must explicitly null only the nullable child FK column—not `organization_id` (e.g. `ON DELETE SET NULL (contract_family_id)` or `ON DELETE SET NULL (extracted_clause_id)`).
+15. Preservation of reviewed audit findings (AUD-015): Re-running document parsing or AI extraction may delete or replace unreviewed AI-generated records (`review_status = AI_EVALUATED`), but must preserve any `extracted_clauses` linked to human-reviewed `risk_alerts` (`review_status IN (HUMAN_CONFIRMED, HUMAN_OVERRIDDEN, DISMISSED_FALSE_POSITIVE)`) or confirmed supersessions (`supersession_state = CONFIRMED_SUPERSEDED`). `risk_alerts.evidence_payload` retains an immutable copy of the source citation and page range so audit trails remain intact indefinitely.
+16. Future default privileges: Default privileges for role `postgres` (both globally and in schema `public`) automatically grant table DML (`SELECT, INSERT, UPDATE, DELETE`) and sequence `USAGE, SELECT` to `onsigning_app`, while revoking all default privileges from `anon`, `authenticated`, `service_role`, and `PUBLIC`.
+17. **Future tables RLS invariant:** PostgreSQL default privileges manage only table/sequence DML and usage grants; they do **not** automatically enable or force Row-Level Security, nor do they create tenant isolation policies. Any future migration that introduces a new table MUST explicitly execute `ENABLE ROW LEVEL SECURITY`, `FORCE ROW LEVEL SECURITY`, and define tenant policies referencing `app.current_organization_id`.
 
 ## 5. Indexing plan
 - `organization_memberships(user_id, organization_id)`.
@@ -190,4 +194,10 @@ doc_error_category:
 - `audit_logs(organization_id, entity_table, entity_id, created_at DESC)`.
 
 ## 6. Migration discipline
-Use ordered, forward-only migrations. Validate the full DDL on a disposable PostgreSQL 16+ instance with extensions installed. Add automated migration tests for role creation privileges, RLS policies, membership/workspace bootstrap, composite FKs, checks, indexes and deletion behavior. Do not treat this logical model as proof that SQL has executed.
+Use ordered, forward-only migrations executed transactionally via `packages/database/run_migration.py`. Every migration is executed in an explicit atomic transaction with fail-closed preflight validation and automated post-commit catalog assertions:
+- `0001_mvp_schema.sql`: 17 base tables, enums, composite FKs, RLS policies.
+- `0002_runtime_grants.sql`: Least-privilege runtime grants to `onsigning_app`.
+- `0003_security_hardening.sql`: Security hardening on `audit_logs`, `users`, and `postgres` schema default privileges.
+- `0004_postgrest_privilege_hardening.sql`: Comprehensive 17-table zero-trust PostgREST boundary and global/public default privilege hardening for role `postgres`.
+
+Automated migration tests (`apps/api/tests/test_run_migration.py`, `test_migration_0003_spec.py`, `test_migration_0004_spec.py`) exercise migration specifications, preflight validation, and assertion logic in standalone CI and mock environments; the migration runner actively prevents pytest from executing migrations against live staging. Live staging database invariants are verified separately through operator-run catalog inspection and audits. Do not treat this logical model as proof that SQL has executed without reviewing the verified staging audit records.

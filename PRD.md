@@ -1,5 +1,5 @@
 # Onsigning — Product Requirements Document
-**Version:** 1.0 · **Status:** Baseline for implementation · **Updated:** 2026-10-19
+**Version:** 1.1 · **Status:** Implementation Baseline · **Updated:** 2026-10-31
 
 ## 1. Product vision
 Onsigning turns signed vendor, supplier, and commercial agreements into actionable, evidence-grounded contract intelligence. It is a post-signature execution layer—not an e-signature tool or a general-purpose document chatbot.
@@ -19,7 +19,7 @@ Initial discovery segment: B2B SaaS companies with vendor/customer agreements an
 | `LEGAL_REVIEWER` | In-house/external counsel | Run audits, review/override findings, confirm relationships and dates |
 | `VIEWER` | Finance, Security, executive | Read-only access to authorized reports, families, Q&A and calendars |
 
-All authorization is enforced server-side. UI hiding is not an authorization control.
+All authorization is enforced server-side. UI hiding is not an authorization control. All application data access is mediated exclusively through the FastAPI application boundary; direct client-side database or PostgREST access is strictly prohibited.
 
 ## 4. Four-feature MVP — built sequentially
 The product is designed for all four features, but implementation proceeds one milestone at a time. Feature 1 is the first deliverable; later features must not delay a useful, testable Feature 1.
@@ -87,7 +87,7 @@ Turn contractual commitments into assigned, trackable work.
 5. In later milestones, the user links documents into a family, confirms supersessions, asks repository questions, and manages obligations.
 
 ## 6. Functional requirements
-- **FR-1 Identity & tenancy:** workspace membership and role checks on every protected operation.
+- **FR-1 Identity & tenancy:** user authentication via Supabase Auth, cryptographic JWT validation via FastAPI, and server-side workspace membership and role checks on every protected operation. Database queries execute strictly under tenant-scoped RLS context as runtime role `onsigning_app`.
 - **FR-2 Document lifecycle:** private upload (.pdf and modern .docx; binary .doc rejected), checksum, parser status, retryable background jobs, structured error tracking, warnings and terminal status.
 - **FR-3 Evidence:** source page range, verbatim quote, citation status, verified flag and uncertainty are stored separately.
 - **FR-4 Playbooks:** versioned declarative rules; each audit references the exact playbook version used.
@@ -121,6 +121,7 @@ Turn contractual commitments into assigned, trackable work.
 | False “missing clause” finding | Coverage tracking and explicit uncertainty states |
 | Amendment applied incorrectly | Human confirmation and immutable history |
 | Cross-tenant leakage | RLS, composite FKs, tenant-context transaction tests |
+| Direct cloud database exposure | Revoke all direct privileges on application tables from PostgREST roles (`anon`, `authenticated`, `service_role`); mediate 100% of data access through FastAPI |
 | Duplicate or lost reminders | Unique idempotency key, retry state and delivery audit |
 | Prompt injection in contract text | Treat source text as untrusted data; isolate instructions and sanitize hidden text |
 | Overbuilding before validation | Ship Feature 1 first; validate buyer pain and willingness to pay during discovery |
