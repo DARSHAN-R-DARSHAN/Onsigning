@@ -443,15 +443,13 @@ async def test_set_user_context_clears_postgresql_org_context_statements():
     assert mock_session.info.get("last_applied_org_id") is None
     assert mock_session.info.get("tenant_context_reapplied_count") is None
 
-    # Verify exact SQL statements executed
-    assert len(executed_queries) == 2
-    # Statement 1: sets user ID
-    stmt_1, params_1 = executed_queries[0]
-    assert "set_config('app.current_user_id'" in stmt_1
-    assert params_1 == {"uid": str(test_user_id)}
-    # Statement 2: clears organization ID
-    stmt_2, params_2 = executed_queries[1]
-    assert "set_config('app.current_organization_id', '', true)" in stmt_2
+    # Verify exact SQL statements executed: combined into a single atomic SELECT statement
+    assert len(executed_queries) == 1
+    stmt_combined, params = executed_queries[0]
+    assert "set_config('app.current_user_id'" in stmt_combined
+    assert "set_config('app.current_organization_id', '', true)" in stmt_combined
+    assert "true" in stmt_combined
+    assert params == {"uid": str(test_user_id)}
 
 
 @pytest.mark.asyncio
@@ -620,14 +618,11 @@ async def test_postgresql_bound_session_executes_set_config_when_global_is_sqlit
     # set_tenant_context in active transaction
     await set_tenant_context(mock_session, user_id=test_user_id, organization_id=test_org_id)
 
-    assert len(executed_queries) == 2
-    stmt_user, params_user = executed_queries[0]
-    assert "set_config('app.current_user_id'" in stmt_user
-    assert params_user == {"uid": str(test_user_id)}
-
-    stmt_org, params_org = executed_queries[1]
-    assert "set_config('app.current_organization_id'" in stmt_org
-    assert params_org == {"org_id": str(test_org_id)}
+    assert len(executed_queries) == 1
+    stmt_combined, params_combined = executed_queries[0]
+    assert "set_config('app.current_user_id'" in stmt_combined
+    assert "set_config('app.current_organization_id'" in stmt_combined
+    assert params_combined == {"uid": str(test_user_id), "org_id": str(test_org_id)}
 
 
 @pytest.mark.asyncio
@@ -666,14 +661,12 @@ async def test_postgresql_bound_session_set_user_context_clears_stale_org_contex
     assert mock_session.info.get("last_applied_org_id") is None
     assert mock_session.info.get("tenant_context_reapplied_count") is None
 
-    # 2. Both GUCs are set/cleared in PostgreSQL
-    assert len(executed_queries) == 2
-    stmt_user, params_user = executed_queries[0]
-    assert "set_config('app.current_user_id'" in stmt_user
-    assert params_user == {"uid": str(test_user_id)}
-
-    stmt_org, _ = executed_queries[1]
-    assert "set_config('app.current_organization_id', '', true)" in stmt_org
+    # 2. Both GUCs are set/cleared in PostgreSQL in a single atomic statement
+    assert len(executed_queries) == 1
+    stmt_combined, params = executed_queries[0]
+    assert "set_config('app.current_user_id'" in stmt_combined
+    assert "set_config('app.current_organization_id', '', true)" in stmt_combined
+    assert params == {"uid": str(test_user_id)}
 
 
 @pytest.mark.asyncio
@@ -709,13 +702,11 @@ async def test_postgresql_bound_session_set_tenant_context_in_active_transaction
     # Case B: in_transaction is True -> executes set_config immediately with system actor (empty user string)
     mock_session.in_transaction.return_value = True
     await set_tenant_context(mock_session, user_id=None, organization_id=test_org_id)
-    assert len(executed_queries) == 2
-    stmt_user, params_user = executed_queries[0]
-    assert "set_config('app.current_user_id'" in stmt_user
-    assert params_user == {"uid": ""}
-    stmt_org, params_org = executed_queries[1]
-    assert "set_config('app.current_organization_id'" in stmt_org
-    assert params_org == {"org_id": str(test_org_id)}
+    assert len(executed_queries) == 1
+    stmt_combined, params_combined = executed_queries[0]
+    assert "set_config('app.current_user_id'" in stmt_combined
+    assert "set_config('app.current_organization_id'" in stmt_combined
+    assert params_combined == {"uid": "", "org_id": str(test_org_id)}
 
 
 @pytest.mark.asyncio

@@ -243,23 +243,38 @@ async def test_response_schema_exact_fields(client: AsyncClient, test_tenant_dat
 
 
 @pytest.mark.asyncio
-async def test_exception_cleanup_restores_user_context(db_session: AsyncSession, test_tenant_data: dict):
+async def test_single_query_discovery_context_and_exception_propagation(
+    db_session: AsyncSession, test_tenant_data: dict
+):
     """
-    Verifies that if an unexpected error occurs during organization fetching,
-    the finally block guarantees context is reset to user-only, preventing tenant leakage.
+    Verifies Phase 2 single-query organization discovery behavior:
+    1. set_user_context is called exactly once before query execution.
+    2. No tenant context switching occurs (no calls to set_tenant_context).
+    3. If db.execute raises an exception, it propagates directly without
+       redundant context cleanup calls.
     """
     from apps.api.routers.organizations import list_user_organizations
     from unittest.mock import AsyncMock
 
     user = User(id=test_tenant_data["user_id"], email="test@acme.com", full_name="Test User")
 
-    with patch("apps.api.routers.organizations.set_tenant_context", new_callable=AsyncMock) as mock_set_tenant, \
-         patch("apps.api.routers.organizations.set_user_context", new_callable=AsyncMock) as mock_set_user:
-        mock_set_tenant.side_effect = RuntimeError("Simulated context failure")
+    # 1. Normal execution: set_user_context called exactly once, results returned
+    with patch("apps.api.routers.organizations.set_user_context", new_callable=AsyncMock) as mock_set_user:
+        orgs = await list_user_organizations(user=user, db=db_session)
+        assert mock_set_user.call_count == 1
+        mock_set_user.assert_called_once_with(db_session, user.id)
+        assert len(orgs) >= 1
+        assert orgs[0].id == test_tenant_data["org_id"]
 
-        with pytest.raises(RuntimeError, match="Simulated context failure"):
-            await list_user_organizations(user=user, db=db_session)
+    # 2. Database exception propagation: error propagates directly, set_user_context called once
+    mock_db = AsyncMock(spec=AsyncSession)
+    mock_db.execute.side_effect = RuntimeError("Simulated query execution failure")
 
-        # Confirm set_user_context was called at entry AND in finally block
-        assert mock_set_user.call_count >= 2
-        mock_set_user.assert_called_with(db_session, user.id)
+    with patch("apps.api.routers.organizations.set_user_context", new_callable=AsyncMock) as mock_set_user:
+        with pytest.raises(RuntimeError, match="Simulated query execution failure"):
+            await list_user_organizations(user=user, db=mock_db)
+
+        # Confirm set_user_context was called once at entry and not redundantly called in cleanup
+        assert mock_set_user.call_count == 1
+        mock_set_user.assert_called_once_with(mock_db, user.id)
+        mock_db.execute.assert_awaited_once()
