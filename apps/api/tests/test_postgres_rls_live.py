@@ -20,6 +20,7 @@ Validates:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import uuid
@@ -495,7 +496,7 @@ class TestDirectPostgresRLS:
         tie_user_id = uuid.uuid4()
         tie_org1_id = uuid.uuid4()
         tie_org2_id = uuid.uuid4()
-        tie_time = "2026-11-20 12:00:00+00"
+        tie_time = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
         await pg_admin_conn.execute(
             "INSERT INTO users (id, email, full_name) VALUES ($1, $2, $3);",
             tie_user_id, f"tie.{uuid.uuid4().hex[:6]}@example.com", "Tie User"
