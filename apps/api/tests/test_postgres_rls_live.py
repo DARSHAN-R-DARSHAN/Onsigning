@@ -511,7 +511,7 @@ class TestDirectPostgresRLS:
             VALUES ($1, $2, $3, 'VIEWER', $4::timestamptz), ($5, $6, $3, 'VIEWER', $4::timestamptz);
             """,
             uuid.uuid4(), tie_org1_id, tie_user_id, tie_time,
-            uuid.uuid4(), tie_org2_id, tie_time
+            uuid.uuid4(), tie_org2_id
         )
         try:
             async with pg_app_conn.transaction():
