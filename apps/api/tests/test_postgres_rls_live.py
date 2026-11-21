@@ -316,9 +316,221 @@ class TestDirectPostgresRLS:
             )
             assert len(other_memberships) == 0
 
-            # Organizations table is still completely invisible (fails closed)
-            orgs_visible = await pg_app_conn.fetchval("SELECT count(*) FROM organizations;")
-            assert orgs_visible == 0
+            # Under Migration 0005 (Phase 2): User A discovers their assigned organization (Org A),
+            # while foreign organizations (Org B) remain completely invisible.
+            orgs_visible = await pg_app_conn.fetch("SELECT id FROM organizations;")
+            assert len(orgs_visible) == 1
+            assert str(orgs_visible[0]["id"]) == data["org_a_id"]
+
+            # An unaffiliated user (with zero memberships) discovers 0 organizations
+            unaffiliated_id = str(uuid.uuid4())
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", unaffiliated_id)
+            unaffiliated_count = await pg_app_conn.fetchval("SELECT count(*) FROM organizations;")
+            assert unaffiliated_count == 0
+
+    @pytest.mark.asyncio
+    async def test_phase2_organization_discovery_rls_matrix(self, pg_app_conn, pg_admin_conn):
+        """
+        Phase 2 Comprehensive Regression Suite for Migration 0005 (Single-Query Discovery RLS).
+        Exhaustively tests all 12 required security and behavioral invariants:
+        1. No user GUC set (uninitialized): zero organizations.
+        2. Empty user GUC ('') set: zero organizations.
+        3. Valid user with no memberships: zero organizations.
+        4. User A with one membership: exactly Org A.
+        5. User A with multiple memberships: exactly the assigned organizations.
+        6. User A cannot discover Org B when only User B belongs to Org B.
+        7. Deleting a membership removes discovery visibility in the next query.
+        8. User context switching across separate transactions returns the correct organization set.
+        9. UPDATE and DELETE remain blocked in pre-tenant context.
+        10. INSERT remains blocked in pre-tenant context.
+        11. Existing tenant-scoped reads and writes continue to work.
+        12. Ordering is deterministic when membership timestamps tie.
+        """
+        import asyncpg
+        data = await _seed_tenants_and_users(pg_admin_conn)
+        org_a_id = data["org_a_id"]
+        org_b_id = data["org_b_id"]
+        user_a_id = data["user_a_id"]
+        user_b_id = data["user_b_id"]
+
+        # 1. No user GUC set (uninitialized): zero organizations
+        async with pg_app_conn.transaction():
+            count_uninit = await pg_app_conn.fetchval("SELECT count(*) FROM organizations;")
+            assert count_uninit == 0
+
+        # 2. Empty user GUC ('') set: zero organizations
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', '', true);")
+            await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+            count_empty = await pg_app_conn.fetchval("SELECT count(*) FROM organizations;")
+            assert count_empty == 0
+
+        # 3. Valid user with no memberships: zero organizations
+        unaffiliated_id = str(uuid.uuid4())
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", unaffiliated_id)
+            await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+            count_unaffil = await pg_app_conn.fetchval("SELECT count(*) FROM organizations;")
+            assert count_unaffil == 0
+
+        # 4. User A with one membership: exactly Org A
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", user_a_id)
+            await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+            rows_a = await pg_app_conn.fetch("SELECT id, name FROM organizations;")
+            assert len(rows_a) == 1
+            assert str(rows_a[0]["id"]) == org_a_id
+
+        # 5. User A with multiple memberships: exactly the assigned organizations
+        m_extra_id = uuid.uuid4()
+        await pg_admin_conn.execute(
+            "INSERT INTO organization_memberships (id, organization_id, user_id, role) VALUES ($1, $2, $3, 'VIEWER');",
+            m_extra_id, uuid.UUID(org_b_id), uuid.UUID(user_a_id)
+        )
+        try:
+            async with pg_app_conn.transaction():
+                await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", user_a_id)
+                await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+                rows_multi = await pg_app_conn.fetch("SELECT id FROM organizations ORDER BY id;")
+                assert len(rows_multi) == 2
+                discovered = {str(r["id"]) for r in rows_multi}
+                assert discovered == {org_a_id, org_b_id}
+        finally:
+            await pg_admin_conn.execute("DELETE FROM organization_memberships WHERE id = $1;", m_extra_id)
+
+        # 6. User A cannot discover Org B when only User B belongs to Org B
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", user_a_id)
+            await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+            org_b_lookup = await pg_app_conn.fetch(
+                "SELECT id FROM organizations WHERE id = $1;", uuid.UUID(org_b_id)
+            )
+            assert len(org_b_lookup) == 0
+
+        # 7. Deleting a membership removes discovery visibility in the next query
+        temp_org_id = uuid.uuid4()
+        temp_user_id = uuid.uuid4()
+        temp_mem_id = uuid.uuid4()
+        await pg_admin_conn.execute(
+            "INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3);",
+            temp_org_id, "Temp Discovery Org", f"temp-{uuid.uuid4().hex[:6]}"
+        )
+        await pg_admin_conn.execute(
+            "INSERT INTO users (id, email, full_name) VALUES ($1, $2, $3);",
+            temp_user_id, f"temp.{uuid.uuid4().hex[:6]}@example.com", "Temp User"
+        )
+        await pg_admin_conn.execute(
+            "INSERT INTO organization_memberships (id, organization_id, user_id, role) VALUES ($1, $2, $3, 'ADMIN');",
+            temp_mem_id, temp_org_id, temp_user_id
+        )
+        try:
+            # Query 1: Visible while membership exists
+            async with pg_app_conn.transaction():
+                await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", str(temp_user_id))
+                await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+                count_before = await pg_app_conn.fetchval("SELECT count(*) FROM organizations;")
+                assert count_before == 1
+
+            # Delete membership
+            await pg_admin_conn.execute("DELETE FROM organization_memberships WHERE id = $1;", temp_mem_id)
+
+            # Query 2: Immediately invisible after deletion
+            async with pg_app_conn.transaction():
+                await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", str(temp_user_id))
+                await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+                count_after = await pg_app_conn.fetchval("SELECT count(*) FROM organizations;")
+                assert count_after == 0
+        finally:
+            await pg_admin_conn.execute("DELETE FROM organizations WHERE id = $1;", temp_org_id)
+            await pg_admin_conn.execute("DELETE FROM users WHERE id = $1;", temp_user_id)
+
+        # 8. User context switching across separate transactions returns the correct organization set
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", user_a_id)
+            rows1 = await pg_app_conn.fetch("SELECT id FROM organizations;")
+            assert str(rows1[0]["id"]) == org_a_id
+
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", user_b_id)
+            rows2 = await pg_app_conn.fetch("SELECT id FROM organizations;")
+            assert str(rows2[0]["id"]) == org_b_id
+
+        # 9. UPDATE and DELETE remain blocked in pre-tenant context
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", user_a_id)
+            await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+            updated = await pg_app_conn.execute(
+                "UPDATE organizations SET name = 'Unauthorized' WHERE id = $1;", uuid.UUID(org_a_id)
+            )
+            assert updated == "UPDATE 0"
+            deleted = await pg_app_conn.execute(
+                "DELETE FROM organizations WHERE id = $1;", uuid.UUID(org_a_id)
+            )
+            assert deleted == "DELETE 0"
+
+        # 10. INSERT remains blocked in pre-tenant context (RLS WITH CHECK fails closed)
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", user_a_id)
+            await pg_app_conn.execute("SELECT set_config('app.current_organization_id', '', true);")
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await pg_app_conn.execute(
+                    "INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3);",
+                    uuid.uuid4(), "Hacked Org", f"hacked-{uuid.uuid4().hex[:6]}"
+                )
+
+        # 11. Existing tenant-scoped reads and writes continue to work
+        async with pg_app_conn.transaction():
+            await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", user_a_id)
+            await pg_app_conn.execute("SELECT set_config('app.current_organization_id', $1, true);", org_a_id)
+            org_doc_count = await pg_app_conn.fetchval(
+                "SELECT count(*) FROM documents WHERE organization_id = $1;", uuid.UUID(org_a_id)
+            )
+            assert org_doc_count == 1
+            updated_tenant = await pg_app_conn.execute(
+                "UPDATE organizations SET name = 'Acme Tenant A Updated' WHERE id = $1;", uuid.UUID(org_a_id)
+            )
+            assert updated_tenant == "UPDATE 1"
+
+        # 12. Ordering is deterministic when membership timestamps tie
+        tie_user_id = uuid.uuid4()
+        tie_org1_id = uuid.uuid4()
+        tie_org2_id = uuid.uuid4()
+        tie_time = "2026-11-20 12:00:00+00"
+        await pg_admin_conn.execute(
+            "INSERT INTO users (id, email, full_name) VALUES ($1, $2, $3);",
+            tie_user_id, f"tie.{uuid.uuid4().hex[:6]}@example.com", "Tie User"
+        )
+        await pg_admin_conn.execute(
+            "INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3), ($4, $5, $6);",
+            tie_org1_id, "Tie Org 1", f"tie1-{uuid.uuid4().hex[:6]}",
+            tie_org2_id, "Tie Org 2", f"tie2-{uuid.uuid4().hex[:6]}"
+        )
+        await pg_admin_conn.execute(
+            """
+            INSERT INTO organization_memberships (id, organization_id, user_id, role, created_at)
+            VALUES ($1, $2, $3, 'VIEWER', $4::timestamptz), ($5, $6, $3, 'VIEWER', $4::timestamptz);
+            """,
+            uuid.uuid4(), tie_org1_id, tie_user_id, tie_time,
+            uuid.uuid4(), tie_org2_id, tie_time
+        )
+        try:
+            async with pg_app_conn.transaction():
+                await pg_app_conn.execute("SELECT set_config('app.current_user_id', $1, true);", str(tie_user_id))
+                query = """
+                SELECT o.id, o.name, m.role::text AS role, o.created_at
+                FROM organization_memberships m
+                JOIN organizations o ON o.id = m.organization_id
+                WHERE m.user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+                ORDER BY m.created_at ASC, o.id ASC;
+                """
+                res1 = await pg_app_conn.fetch(query)
+                res2 = await pg_app_conn.fetch(query)
+                assert len(res1) == 2
+                assert [str(r["id"]) for r in res1] == [str(r["id"]) for r in res2]
+                assert str(res1[0]["id"]) < str(res1[1]["id"])  # strictly sorted by o.id ASC
+        finally:
+            await pg_admin_conn.execute("DELETE FROM organizations WHERE id IN ($1, $2);", tie_org1_id, tie_org2_id)
+            await pg_admin_conn.execute("DELETE FROM users WHERE id = $1;", tie_user_id)
 
     @pytest.mark.asyncio
     async def test_audit_logs_append_only_privilege_denials(self, pg_app_conn, pg_admin_conn):

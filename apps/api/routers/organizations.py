@@ -13,9 +13,10 @@ from sqlalchemy import select
 
 from apps.api.core.database import (
     get_db, Organization, OrganizationMembership,
-    set_user_context, set_tenant_context
+    set_user_context
 )
 from apps.api.core.auth import get_current_user, User
+from apps.api.core.logging import logger
 
 router = APIRouter(prefix="/api/v1/organizations", tags=["Organizations"])
 
@@ -41,50 +42,49 @@ async def list_user_organizations(
     2. Does NOT require X-Organization-Id; operates in pre-tenant discovery mode.
     3. Sets user-only RLS context (set_user_context) so dual-predicate RLS restricts
        membership queries strictly to user_id = current_setting('app.current_user_id').
-    4. For each verified membership, temporarily applies tenant context (set_tenant_context)
-       to read organization metadata under RLS without bypass or privilege escalation.
-    5. Always restores user-only context in a finally block to prevent tenant context pollution.
+    4. Executes a single JOIN between organization_memberships and organizations under
+       RLS user discovery policy, eliminating sequential N+1 database roundtrips.
+    5. Operates strictly in user discovery mode without altering app.current_organization_id,
+       preventing tenant context pollution.
     6. Returns an empty list with HTTP 200 if the user has no memberships.
     """
     # 1. Establish user-only context for RLS
     await set_user_context(db, user.id)
 
-    try:
-        # 2. Query memberships belonging strictly to this user
-        stmt = (
-            select(OrganizationMembership)
-            .where(OrganizationMembership.user_id == user.id)
-            .order_by(OrganizationMembership.created_at.asc())
+    # 2. Query memberships joined with organizations under user-only RLS context
+    # Single aggregated query eliminating per-membership sequential roundtrips (Phase 2 optimization)
+    stmt = (
+        select(
+            Organization.id,
+            Organization.name,
+            Organization.slug,
+            OrganizationMembership.role,
+            Organization.created_at,
         )
-        result = await db.execute(stmt)
-        memberships = result.scalars().all()
+        .join(
+            Organization,
+            Organization.id == OrganizationMembership.organization_id
+        )
+        .where(OrganizationMembership.user_id == user.id)
+        .order_by(
+            OrganizationMembership.created_at.asc(),
+            Organization.id.asc()
+        )
+    )
+    result = await db.execute(stmt)
+    rows = result.all()
 
-        if not memberships:
-            return []
+    organizations: List[OrganizationSummaryResponse] = []
+    for r in rows:
+        role_val = r.role.value if hasattr(r.role, "value") else str(r.role)
+        organizations.append(
+            OrganizationSummaryResponse(
+                id=str(r.id),
+                name=r.name,
+                slug=r.slug,
+                role=role_val,
+                created_at=r.created_at
+            )
+        )
 
-        # 3. For each verified membership, retrieve organization metadata under matching tenant context
-        organizations: List[OrganizationSummaryResponse] = []
-        for m in memberships:
-            org_id = str(m.organization_id)
-            await set_tenant_context(db, user.id, org_id)
-
-            org_stmt = select(Organization).where(Organization.id == org_id)
-            org_res = await db.execute(org_stmt)
-            org = org_res.scalar_one_or_none()
-
-            if org:
-                role_val = m.role.value if hasattr(m.role, "value") else str(m.role)
-                organizations.append(
-                    OrganizationSummaryResponse(
-                        id=str(org.id),
-                        name=org.name,
-                        slug=org.slug,
-                        role=role_val,
-                        created_at=org.created_at
-                    )
-                )
-
-        return organizations
-    finally:
-        # 4. Guarantee cleanup back to user-scoped context
-        await set_user_context(db, user.id)
+    return organizations

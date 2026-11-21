@@ -26,14 +26,22 @@ EXIT_PREFLIGHT_FAILURE = 1
 EXIT_MIGRATION_FAILURE = 2
 EXIT_VERIFICATION_FAILURE = 3
 
+# Dry-Run Status Identifiers
+DRY_RUN_STATUS_PENDING = "PENDING"
+DRY_RUN_STATUS_ALREADY_APPLIED = "ALREADY_APPLIED"
+DRY_RUN_STATUS_DRIFTED = "DRIFTED"
+DRY_RUN_STATUS_BLOCKED = "BLOCKED"
+
 DEFAULT_MIGRATION_FILENAME = "0003_security_hardening.sql"
 MIGRATION_FILENAME = DEFAULT_MIGRATION_FILENAME
 APPROVED_MIGRATION_0003_SHA256 = "8ca03f97e7fe21b7ec208ef4b3835ba1af5ca2c9eef2f251a6ba4716b767ef28"
 APPROVED_MIGRATION_0004_SHA256 = "3d4a23a5b27341e1f724a052180c8831b46e544532165bfd3fa68a859696d062"
+APPROVED_MIGRATION_0005_SHA256 = "7eff2f1d3ad3252e7351d6c32a2ea664b95d1fc2a1cd906d38563c7dc7a30bbe"
 
 APPROVED_MIGRATIONS: Dict[str, str] = {
     "0003_security_hardening.sql": APPROVED_MIGRATION_0003_SHA256,
     "0004_postgrest_privilege_hardening.sql": APPROVED_MIGRATION_0004_SHA256,
+    "0005_organization_discovery_rls.sql": APPROVED_MIGRATION_0005_SHA256,
 }
 
 
@@ -117,6 +125,12 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         default=60.0,
         help="Command execution timeout in seconds (default 60s).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Execute in strictly read-only mode to inspect prerequisites and migration state without applying DDL.",
     )
     return parser.parse_args(args)
 
@@ -290,7 +304,7 @@ def validate_preflight_config(
         )
 
     try:
-        sql_bytes = migration_file.read_bytes()
+        sql_bytes = migration_file.read_bytes().replace(b"\r\n", b"\n")
         sha256 = hashlib.sha256(sql_bytes).hexdigest()
         sql_text = sql_bytes.decode("utf-8")
     except Exception as e:
@@ -325,6 +339,7 @@ def validate_preflight_config(
         "ca_path": args.ca_path,
         "timeout": args.timeout,
         "allow_insecure_local_tls": allow_insecure_local_tls,
+        "dry_run": getattr(args, "dry_run", False),
     }
 
     return True, "Pre-flight validation passed.", config
@@ -758,6 +773,299 @@ async def execute_and_verify(
             await conn.close()
 
 
+def check_policy_0005_equivalence(policy_row: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Evaluates whether an existing policy on public.organizations strictly matches
+    the approved security semantics of 0005_organization_discovery_rls.sql.
+    
+    Verifies:
+    1. Command: Must be SELECT-only (or catalog 'r').
+    2. Permissiveness: Must be PERMISSIVE.
+    3. Roles: Must apply to 'public' (universal role scope).
+    4. Write safety: WITH CHECK must be empty/None.
+    5. Structural integrity: Entire USING expression must be an EXISTS (SELECT 1 FROM ...)
+       subquery against public.organization_memberships without outer disjunctions (OR).
+    6. Correlation: Must correlate organization_id = organizations.id.
+    7. User isolation: Must check user_id against NULLIF(current_setting('app.current_user_id', true), '')::uuid.
+    """
+    cmd = str(policy_row.get("cmd", "")).upper()
+    if cmd not in ("SELECT", "R"):
+        return False, f"Expected command SELECT, found '{cmd}'"
+
+    permissive = str(policy_row.get("permissive", "")).upper()
+    if permissive != "PERMISSIVE":
+        return False, f"Expected PERMISSIVE policy, found '{permissive}'"
+
+    roles = policy_row.get("roles")
+    if roles is not None:
+        if isinstance(roles, str):
+            roles_list = [roles.strip().lower()]
+        else:
+            roles_list = [str(r).strip().lower() for r in roles]
+        if "public" not in roles_list:
+            return False, f"Expected policy to apply to 'public', found {roles_list}"
+
+    with_check = policy_row.get("with_check")
+    if with_check and str(with_check).strip() not in ("", "none", "null"):
+        return False, f"Unexpected WITH CHECK on SELECT policy: '{with_check}'"
+
+    qual = str(policy_row.get("qual", "")).strip()
+    q = re.sub(r"\s+", " ", qual.lower())
+
+    # Strip outer parentheses if present in deparsed catalog expression
+    while q.startswith("(") and q.endswith(")"):
+        inner = q[1:-1].strip()
+        if inner.startswith("exists"):
+            q = inner
+        else:
+            break
+
+    if not q.startswith("exists (select 1 from "):
+        return False, "USING expression must be an EXISTS (SELECT 1 FROM ...) subquery"
+
+    if " or " in q:
+        return False, "Disjunction OR is strictly prohibited in discovery policy"
+
+    # Match relation and alias
+    match = re.search(r"from\s+(?:public\.)?organization_memberships(?:\s+as)?\s+(\w+)", q)
+    if not match:
+        return False, "Subquery must select from organization_memberships"
+
+    alias = match.group(1)
+
+    # Check organization_id correlation
+    has_org_corr = (
+        f"{alias}.organization_id = organizations.id" in q
+        or f"organizations.id = {alias}.organization_id" in q
+    )
+    if not has_org_corr:
+        return False, f"Missing correlation: '{alias}.organization_id = organizations.id'"
+
+    # Check user_id filter with fail-closed NULLIF
+    user_pattern = (
+        rf"{alias}\.user_id\s*=\s*\(?\s*nullif\(\s*current_setting\(\s*'app\.current_user_id'(?:::text)?,\s*true\s*\),\s*''(?:::text)?\s*\)(?:::uuid)?"
+    )
+    if not re.search(user_pattern, q):
+        return False, "Missing fail-closed user_id check against NULLIF(current_setting('app.current_user_id', true), '')::uuid"
+
+    return True, "Policy matches approved 0005 semantics."
+
+
+async def _dry_run_inspect_0005(conn: Any, config: Dict[str, Any]) -> int:
+    """
+    Executes read-only catalog queries to inspect prerequisites and policy state
+    for 0005_organization_discovery_rls.sql.
+    """
+    print("[DRY-RUN] Inspecting required tables and RLS enforcement...")
+
+    # 1. Inspect required tables and RLS state
+    table_rows = await conn.fetch(
+        """
+        SELECT
+            c.relname AS table_name,
+            c.relrowsecurity AS rls_enabled,
+            c.relforcerowsecurity AS rls_forced
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relname IN ('organizations', 'organization_memberships');
+        """
+    )
+
+    found_tables = {r["table_name"]: r for r in table_rows}
+
+    for req_table in ("organizations", "organization_memberships"):
+        if req_table not in found_tables:
+            print(f"[DRY-RUN BLOCKED] Prerequisite table missing: 'public.{req_table}' does not exist.", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILURE
+
+        r_info = found_tables[req_table]
+        if not r_info["rls_enabled"]:
+            print(f"[DRY-RUN BLOCKED] RLS disabled on table 'public.{req_table}'. Must have ENABLE ROW LEVEL SECURITY.", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILURE
+
+        if not r_info["rls_forced"]:
+            print(f"[DRY-RUN BLOCKED] FORCE RLS disabled on table 'public.{req_table}'. Must have FORCE ROW LEVEL SECURITY.", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILURE
+
+    print("[DRY-RUN] Verified tables 'organizations' and 'organization_memberships' exist with ENABLE and FORCE RLS.")
+
+    # 2. Inspect existing policies
+    policy_rows = await conn.fetch(
+        """
+        SELECT
+            tablename,
+            policyname,
+            cmd,
+            permissive,
+            roles::text[] AS roles,
+            qual,
+            with_check
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename IN ('organizations', 'organization_memberships');
+        """
+    )
+
+    policies_by_table: Dict[str, Dict[str, Any]] = {"organizations": {}, "organization_memberships": {}}
+    for p in policy_rows:
+        t_name = p["tablename"]
+        if t_name in policies_by_table:
+            policies_by_table[t_name][p["policyname"]] = p
+
+    # 3. Check prerequisite policies (from migrations 0001-0004)
+    org_policies = policies_by_table["organizations"]
+    mem_policies = policies_by_table["organization_memberships"]
+
+    if "tenant_isolation_organizations" not in org_policies:
+        print("[DRY-RUN BLOCKED] Prerequisite policy 'tenant_isolation_organizations' missing on public.organizations.", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILURE
+
+    if "tenant_isolation_memberships" not in mem_policies:
+        print("[DRY-RUN BLOCKED] Prerequisite policy 'tenant_isolation_memberships' missing on public.organization_memberships.", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILURE
+
+    print("[DRY-RUN] Verified prerequisite tenant isolation policies exist.")
+
+    # 4. Check target policy state: user_discovery_organizations
+    target_policy = org_policies.get("user_discovery_organizations")
+    if target_policy is None:
+        print("\n================================================================================")
+        print("[DRY-RUN STATUS] Migration 0005_organization_discovery_rls.sql is: PENDING")
+        print("================================================================================")
+        print("[DRY-RUN] Prerequisite tables:   PRESENT (organizations, organization_memberships)")
+        print("[DRY-RUN] RLS state:             ENABLED & FORCED on both tables")
+        print("[DRY-RUN] Prerequisite policies: PRESENT (tenant_isolation_organizations, tenant_isolation_memberships)")
+        print("[DRY-RUN] Discovery policy:      NOT APPLIED (user_discovery_organizations does not exist)")
+        print("[DRY-RUN] Conclusion:            Ready to apply. Zero schema or policy changes made.")
+        return EXIT_SUCCESS
+
+    # Target policy exists: perform semantic equivalence check
+    is_match, match_reason = check_policy_0005_equivalence(target_policy)
+    cmd = str(target_policy.get("cmd", "")).upper()
+    with_check = target_policy.get("with_check")
+
+    if is_match:
+        print("\n================================================================================")
+        print("[DRY-RUN STATUS] Migration 0005_organization_discovery_rls.sql is: ALREADY APPLIED")
+        print("================================================================================")
+        print("[DRY-RUN] Policy 'user_discovery_organizations' already exists on public.organizations.")
+        print("[DRY-RUN] Existing definition matches approved 0005 semantics:")
+        print(f"          - Command: {cmd}")
+        print(f"          - Permissive: {target_policy.get('permissive')}")
+        print(f"          - USING: {target_policy.get('qual')}")
+        print("[DRY-RUN] Conclusion:            Migration is already applied. No further action needed.")
+        return EXIT_SUCCESS
+    else:
+        print("\n================================================================================")
+        print("[DRY-RUN STATUS] Migration 0005_organization_discovery_rls.sql is: DRIFTED", file=sys.stderr)
+        print("================================================================================")
+        print(f"[DRY-RUN ALERT] Policy 'user_discovery_organizations' exists but definition differs from approved migration:", file=sys.stderr)
+        print(f"          - Discrepancy: {match_reason}", file=sys.stderr)
+        print(f"          - Command: {cmd} (expected: SELECT)", file=sys.stderr)
+        print(f"          - USING: {target_policy.get('qual')}", file=sys.stderr)
+        print(f"          - WITH CHECK: {with_check} (expected: None)", file=sys.stderr)
+        return EXIT_VERIFICATION_FAILURE
+
+
+async def execute_dry_run(
+    config: Dict[str, Any],
+    conn_override: Optional[Any] = None,
+) -> int:
+    """
+    Executes a strictly read-only dry-run against the target database catalog.
+    Enforces that NO migration SQL is executed and NO database state is modified.
+    """
+    # Deferred asyncpg import
+    try:
+        import asyncpg
+    except ImportError:
+        print("[PRE-FLIGHT ERROR] Required driver 'asyncpg' is not installed.", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILURE
+
+    if config.get("allow_insecure_local_tls", False):
+        if config["hostname"] not in ("localhost", "127.0.0.1", "::1"):
+            print("[PRE-FLIGHT ERROR] Insecure TLS is strictly forbidden for non-localhost targets.", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILURE
+        ssl_ctx = None
+    else:
+        print("[DRY-RUN] Initializing TLS secure context (TLS 1.2+ minimum)...")
+        try:
+            ssl_ctx = build_ssl_context(config.get("ca_path"))
+        except Exception as e:
+            print(f"[PRE-FLIGHT ERROR] Failed to construct TLS context: {sanitize_log(e)}", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILURE
+
+    conn = conn_override
+    owns_conn = False
+
+    if conn is None:
+        print(f"[DRY-RUN] Connecting to endpoint {config['hostname']}:{config['port']}/{config['db_name']} in read-only mode...")
+        try:
+            conn = await asyncpg.connect(
+                dsn=config["dsn"],
+                ssl=ssl_ctx,
+                statement_cache_size=0,
+                command_timeout=config["timeout"],
+            )
+            owns_conn = True
+        except Exception as e:
+            print(f"[PRE-FLIGHT ERROR] Database connection failed: {sanitize_log(e)}", file=sys.stderr)
+            return EXIT_PREFLIGHT_FAILURE
+
+    try:
+        # =========================================================================
+        # SAFETY BOUNDARY: STRICTLY READ-ONLY DRY-RUN EXECUTION
+        # - This path NEVER calls conn.execute(config["migration_sql"]).
+        # - This path NEVER executes DDL, DML, or schema alterations.
+        # - Transaction is opened with readonly=True (PostgreSQL enforces no writes).
+        # - Inspects catalogs only to determine readiness of target migration.
+        # =========================================================================
+        print("[DRY-RUN] Establishing read-only transaction for catalog inspection...")
+        async with conn.transaction(readonly=True):
+            # 1. Server Identity Validation
+            row = await conn.fetchrow(
+                "SELECT current_database() AS db_name, current_user AS user_name, inet_server_addr()::text AS server_ip;"
+            )
+            if not row:
+                print("[DRY-RUN BLOCKED] Server identity query returned no rows.", file=sys.stderr)
+                return EXIT_PREFLIGHT_FAILURE
+
+            server_db = row["db_name"]
+            server_user = row["user_name"]
+
+            if server_user != "postgres":
+                print(
+                    f"[DRY-RUN BLOCKED] Identity check failed: current_user is '{server_user}', expected 'postgres'.",
+                    file=sys.stderr,
+                )
+                return EXIT_PREFLIGHT_FAILURE
+
+            if server_db != config["db_name"]:
+                print(
+                    f"[DRY-RUN BLOCKED] Database check failed: current_database is '{server_db}', expected '{config['db_name']}'.",
+                    file=sys.stderr,
+                )
+                return EXIT_PREFLIGHT_FAILURE
+
+            print(f"[DRY-RUN] Verified database '{server_db}' and execution role '{server_user}'.")
+            print(f"[DRY-RUN] Target migration: {config['migration_filename']} (SHA-256: {config['migration_sha256']})")
+
+            # Dispatch to migration-specific inspection
+            if config["migration_filename"] == "0005_organization_discovery_rls.sql":
+                return await _dry_run_inspect_0005(conn, config)
+            else:
+                print(f"[DRY-RUN] Generic pre-flight catalog verification passed for {config['migration_filename']}.")
+                return EXIT_SUCCESS
+
+    except Exception as exc:
+        print(f"[DRY-RUN ERROR] Catalog inspection failed: {sanitize_log(exc)}", file=sys.stderr)
+        return EXIT_PREFLIGHT_FAILURE
+    finally:
+        if owns_conn and conn is not None:
+            await conn.close()
+
+
 def main(args: Optional[List[str]] = None) -> int:
     """Entry point for the migration runner CLI."""
     parsed_args = parse_args(args)
@@ -767,6 +1075,11 @@ def main(args: Optional[List[str]] = None) -> int:
         return EXIT_PREFLIGHT_FAILURE
 
     assert config is not None
+
+    # Strict architectural boundary: dry-run never enters execute_and_verify
+    if parsed_args.dry_run:
+        return asyncio.run(execute_dry_run(config))
+
     return asyncio.run(execute_and_verify(config))
 
 

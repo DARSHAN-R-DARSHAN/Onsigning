@@ -21,12 +21,15 @@ from packages.database.run_migration import (
     EXIT_VERIFICATION_FAILURE,
     APPROVED_MIGRATION_0003_SHA256,
     APPROVED_MIGRATION_0004_SHA256,
+    APPROVED_MIGRATION_0005_SHA256,
     APPROVED_MIGRATIONS,
     mask_dsn,
     sanitize_log,
     parse_args,
     validate_preflight_config,
     execute_and_verify,
+    execute_dry_run,
+    check_policy_0005_equivalence,
     main,
 )
 
@@ -1262,3 +1265,347 @@ async def test_disposable_postgres_live_runner_integration_0004():
                 raise RuntimeError(f"Live integration cleanup failed: {cleanup_errors}")
             else:
                 sys.stderr.write(f"\n[CLEANUP WARNING] Secondary error during teardown: {cleanup_errors}\n")
+
+
+# ==============================================================================
+# 6. READ-ONLY DRY-RUN MODE TESTS (--dry-run)
+# ==============================================================================
+
+@pytest.fixture
+def valid_dry_run_env():
+    """Returns valid environment for staging dry-run."""
+    return {
+        "ONSIGNING_MIGRATION_OPT_IN": "1",
+        "ONSIGNING_STAGING_PROJECT_REF": "ixbmyzrzwmlaltmxgmbo",
+        "ONSIGNING_MIGRATION_DSN": "postgresql://postgres:mockpassword@db.ixbmyzrzwmlaltmxgmbo.supabase.co:5432/postgres",
+        "ONSIGNING_RUNNER_TEST_MODE": "true",
+    }
+
+
+@pytest.fixture
+def valid_dry_run_args():
+    """Returns valid dry-run CLI arguments."""
+    return argparse.Namespace(
+        target="staging",
+        confirm_staging=True,
+        project_ref="ixbmyzrzwmlaltmxgmbo",
+        expected_db="postgres",
+        ca_path=None,
+        timeout=60.0,
+        migration="0005_organization_discovery_rls.sql",
+        dry_run=True,
+    )
+
+
+def _build_mock_dry_run_conn(
+    table_rows=None,
+    policy_rows=None,
+    server_db="postgres",
+    server_user="postgres",
+):
+    """Builds a mock asyncpg connection with transaction(readonly=True) tracking."""
+    conn = AsyncMock()
+
+    # Identity query return
+    conn.fetchrow.return_value = {
+        "db_name": server_db,
+        "user_name": server_user,
+        "server_ip": "127.0.0.1",
+    }
+
+    # Default valid catalog state
+    if table_rows is None:
+        table_rows = [
+            {"table_name": "organizations", "rls_enabled": True, "rls_forced": True},
+            {"table_name": "organization_memberships", "rls_enabled": True, "rls_forced": True},
+        ]
+    if policy_rows is None:
+        policy_rows = [
+            {"tablename": "organizations", "policyname": "tenant_isolation_organizations"},
+            {"tablename": "organization_memberships", "policyname": "tenant_isolation_memberships"},
+        ]
+
+    async def mock_fetch(query, *args):
+        q = query.lower()
+        if "from pg_class" in q:
+            return table_rows
+        if "from pg_policies" in q:
+            return policy_rows
+        return []
+
+    conn.fetch.side_effect = mock_fetch
+
+    # Mock transaction context manager: conn.transaction() returns an async context manager
+    tx = AsyncMock()
+    conn.transaction = MagicMock(return_value=tx)
+    tx.__aenter__.return_value = tx
+    tx.__aexit__.return_value = False
+
+    return conn
+
+
+def test_dry_run_flag_parsed_correctly():
+    """1. CLI parses --dry-run."""
+    args = parse_args([
+        "--target", "staging",
+        "--confirm-staging",
+        "--project-ref", "ixbmyzrzwmlaltmxgmbo",
+        "--migration", "0005_organization_discovery_rls.sql",
+        "--dry-run"
+    ])
+    assert args.dry_run is True
+
+    # Without --dry-run, defaults to False
+    args_normal = parse_args([
+        "--target", "staging",
+        "--confirm-staging",
+        "--project-ref", "ixbmyzrzwmlaltmxgmbo",
+        "--migration", "0005_organization_discovery_rls.sql"
+    ])
+    assert args_normal.dry_run is False
+
+
+def test_dry_run_does_not_invoke_execute_and_verify(valid_dry_run_env):
+    """2. Dry-run does not invoke execute_and_verify."""
+    cli_args = [
+        "--target", "staging",
+        "--confirm-staging",
+        "--project-ref", "ixbmyzrzwmlaltmxgmbo",
+        "--migration", "0005_organization_discovery_rls.sql",
+        "--dry-run"
+    ]
+    with patch.dict(os.environ, valid_dry_run_env), \
+         patch("packages.database.run_migration.execute_and_verify", new_callable=AsyncMock) as mock_apply, \
+         patch("packages.database.run_migration.execute_dry_run", new_callable=AsyncMock) as mock_dry:
+        mock_dry.return_value = EXIT_SUCCESS
+        exit_code = main(cli_args)
+        assert exit_code == EXIT_SUCCESS
+        assert mock_dry.called
+        assert not mock_apply.called
+
+
+@pytest.mark.asyncio
+async def test_dry_run_never_passes_migration_sql_to_conn_execute(valid_dry_run_args, valid_dry_run_env):
+    """3. Dry-run never passes migration SQL to conn.execute."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    mock_conn = _build_mock_dry_run_conn()
+    exit_code = await execute_dry_run(config, conn_override=mock_conn)
+    assert exit_code == EXIT_SUCCESS
+
+    # Verify conn.execute was NEVER called with migration SQL
+    for call in mock_conn.execute.call_args_list:
+        executed_sql = str(call[0][0])
+        assert config["migration_sql"] not in executed_sql
+        assert "CREATE POLICY" not in executed_sql
+
+
+def test_dry_run_refuses_incorrect_project_ref(valid_dry_run_args, valid_dry_run_env):
+    """4. Dry-run refuses incorrect project ref."""
+    valid_dry_run_args.project_ref = "wrong-project-ref"
+    ok, msg, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert not ok
+    assert "Project reference mismatch" in msg
+    assert config is None
+
+
+def test_dry_run_refuses_hash_mismatch(valid_dry_run_args, valid_dry_run_env, monkeypatch):
+    """5. Dry-run refuses migration hash mismatch."""
+    real_read_bytes = Path.read_bytes
+
+    def fake_read_bytes(self):
+        if self.name == "0005_organization_discovery_rls.sql":
+            return b"-- altered bytes\n"
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+    ok, msg, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert not ok
+    assert "Migration integrity check failed: SHA-256 digest" in msg
+    assert APPROVED_MIGRATION_0005_SHA256 in msg
+    assert config is None
+
+
+@pytest.mark.asyncio
+async def test_missing_prerequisite_tables_produce_blocked(valid_dry_run_args, valid_dry_run_env):
+    """6. Missing prerequisite tables produce BLOCKED."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    # Only organizations exists, organization_memberships is missing
+    table_rows = [{"table_name": "organizations", "rls_enabled": True, "rls_forced": True}]
+    mock_conn = _build_mock_dry_run_conn(table_rows=table_rows)
+
+    exit_code = await execute_dry_run(config, conn_override=mock_conn)
+    assert exit_code == EXIT_PREFLIGHT_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_rls_disabled_produces_blocked(valid_dry_run_args, valid_dry_run_env):
+    """7. RLS disabled produces BLOCKED."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    table_rows = [
+        {"table_name": "organizations", "rls_enabled": False, "rls_forced": True},
+        {"table_name": "organization_memberships", "rls_enabled": True, "rls_forced": True},
+    ]
+    mock_conn = _build_mock_dry_run_conn(table_rows=table_rows)
+
+    exit_code = await execute_dry_run(config, conn_override=mock_conn)
+    assert exit_code == EXIT_PREFLIGHT_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_force_rls_disabled_produces_blocked(valid_dry_run_args, valid_dry_run_env):
+    """8. FORCE RLS disabled produces BLOCKED."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    table_rows = [
+        {"table_name": "organizations", "rls_enabled": True, "rls_forced": True},
+        {"table_name": "organization_memberships", "rls_enabled": True, "rls_forced": False},
+    ]
+    mock_conn = _build_mock_dry_run_conn(table_rows=table_rows)
+
+    exit_code = await execute_dry_run(config, conn_override=mock_conn)
+    assert exit_code == EXIT_PREFLIGHT_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_missing_prerequisite_policies_produce_blocked(valid_dry_run_args, valid_dry_run_env):
+    """9. Missing prerequisite policies produce BLOCKED."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    # tenant_isolation_organizations is missing
+    policy_rows = [
+        {"tablename": "organization_memberships", "policyname": "tenant_isolation_memberships"},
+    ]
+    mock_conn = _build_mock_dry_run_conn(policy_rows=policy_rows)
+
+    exit_code = await execute_dry_run(config, conn_override=mock_conn)
+    assert exit_code == EXIT_PREFLIGHT_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_existing_matching_policy_produces_already_applied(valid_dry_run_args, valid_dry_run_env):
+    """10. Existing matching policy produces ALREADY_APPLIED."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    policy_rows = [
+        {"tablename": "organizations", "policyname": "tenant_isolation_organizations"},
+        {"tablename": "organization_memberships", "policyname": "tenant_isolation_memberships"},
+        {
+            "tablename": "organizations",
+            "policyname": "user_discovery_organizations",
+            "cmd": "SELECT",
+            "permissive": "PERMISSIVE",
+            "qual": "EXISTS (SELECT 1 FROM organization_memberships m WHERE ((m.organization_id = organizations.id) AND (m.user_id = (NULLIF(current_setting('app.current_user_id'::text, true), ''::text))::uuid)))",
+            "with_check": None,
+        },
+    ]
+    mock_conn = _build_mock_dry_run_conn(policy_rows=policy_rows)
+
+    exit_code = await execute_dry_run(config, conn_override=mock_conn)
+    assert exit_code == EXIT_SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_missing_policy_with_prerequisites_produces_pending(valid_dry_run_args, valid_dry_run_env):
+    """11. Missing policy with prerequisites produces PENDING."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    # Prerequisites exist, but user_discovery_organizations is not present
+    policy_rows = [
+        {"tablename": "organizations", "policyname": "tenant_isolation_organizations"},
+        {"tablename": "organization_memberships", "policyname": "tenant_isolation_memberships"},
+    ]
+    mock_conn = _build_mock_dry_run_conn(policy_rows=policy_rows)
+
+    exit_code = await execute_dry_run(config, conn_override=mock_conn)
+    assert exit_code == EXIT_SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_existing_policy_with_mismatched_definition_produces_drifted(valid_dry_run_args, valid_dry_run_env):
+    """12. Existing policy with mismatched definition produces DRIFTED."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    policy_rows = [
+        {"tablename": "organizations", "policyname": "tenant_isolation_organizations"},
+        {"tablename": "organization_memberships", "policyname": "tenant_isolation_memberships"},
+        {
+            "tablename": "organizations",
+            "policyname": "user_discovery_organizations",
+            "cmd": "ALL",  # Drift: should be SELECT only
+            "permissive": "PERMISSIVE",
+            "qual": "true",  # Drift: insecure open expression
+            "with_check": None,
+        },
+    ]
+    mock_conn = _build_mock_dry_run_conn(policy_rows=policy_rows)
+
+    exit_code = await execute_dry_run(config, conn_override=mock_conn)
+    assert exit_code == EXIT_VERIFICATION_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_inspection_transaction_is_read_only(valid_dry_run_args, valid_dry_run_env):
+    """13. Inspection transaction is read-only."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    mock_conn = _build_mock_dry_run_conn()
+    await execute_dry_run(config, conn_override=mock_conn)
+
+    # Must invoke conn.transaction(readonly=True)
+    mock_conn.transaction.assert_called_once_with(readonly=True)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_connections_close_on_success_and_failure(valid_dry_run_args, valid_dry_run_env):
+    """14. Dry-run connections close on success and failure."""
+    ok, _, config = validate_preflight_config(valid_dry_run_args, valid_dry_run_env)
+    assert ok and config is not None
+
+    # Test failure path with a simulated connection error inside transaction
+    mock_conn_fail = _build_mock_dry_run_conn()
+    mock_conn_fail.fetchrow.side_effect = RuntimeError("Simulated query failure")
+
+    with patch("asyncpg.connect", new_callable=AsyncMock) as mock_connect:
+        mock_connect.return_value = mock_conn_fail
+        exit_code = await execute_dry_run(config)
+        assert exit_code == EXIT_PREFLIGHT_FAILURE
+        mock_conn_fail.close.assert_awaited_once()
+
+    # Test success path
+    mock_conn_succ = _build_mock_dry_run_conn()
+    with patch("asyncpg.connect", new_callable=AsyncMock) as mock_connect:
+        mock_connect.return_value = mock_conn_succ
+        exit_code = await execute_dry_run(config)
+        assert exit_code == EXIT_SUCCESS
+        mock_conn_succ.close.assert_awaited_once()
+
+
+def test_existing_apply_mode_invokes_execute_and_verify(valid_dry_run_env):
+    """15. Existing apply mode invokes execute_and_verify."""
+    cli_args = [
+        "--target", "staging",
+        "--confirm-staging",
+        "--project-ref", "ixbmyzrzwmlaltmxgmbo",
+        "--migration", "0005_organization_discovery_rls.sql"
+    ]
+    with patch.dict(os.environ, valid_dry_run_env), \
+         patch("packages.database.run_migration.execute_and_verify", new_callable=AsyncMock) as mock_apply, \
+         patch("packages.database.run_migration.execute_dry_run", new_callable=AsyncMock) as mock_dry:
+        mock_apply.return_value = EXIT_SUCCESS
+        exit_code = main(cli_args)
+        assert exit_code == EXIT_SUCCESS
+        assert mock_apply.called
+        assert not mock_dry.called
+
