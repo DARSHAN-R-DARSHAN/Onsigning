@@ -37,8 +37,16 @@ engine_kwargs = {
 
 if not is_sqlite:
     engine_kwargs.update({
-        "pool_size": settings.DB_POOL_SIZE,
-        "max_overflow": settings.DB_MAX_OVERFLOW,
+        "pool_size": 5,
+        "max_overflow": 5,
+        "pool_timeout": 30.0,
+        "pool_recycle": 300,
+        "pool_pre_ping": True,
+        "connect_args": {
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0,
+            "command_timeout": 30.0,
+        },
     })
 
 engine = create_async_engine(settings.DATABASE_URL, **engine_kwargs)
@@ -215,12 +223,12 @@ def _reapply_tenant_context_on_transaction_begin(session: Session, transaction, 
 
     if connection.dialect.name != "sqlite":
         connection.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true);"),
-            {"uid": user_id}
-        )
-        connection.execute(
-            text("SELECT set_config('app.current_organization_id', :org_id, true);"),
-            {"org_id": org_id}
+            text("""
+                SELECT
+                    set_config('app.current_user_id', :uid, true),
+                    set_config('app.current_organization_id', :org_id, true);
+            """),
+            {"uid": user_id, "org_id": org_id}
         )
     else:
         # SQLite verification tracking
@@ -300,11 +308,12 @@ async def set_user_context(
 
     if not _is_sqlite_session(session):
         await session.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true);"),
+            text("""
+                SELECT
+                    set_config('app.current_user_id', :uid, true),
+                    set_config('app.current_organization_id', '', true);
+            """),
             {"uid": uid_str}
-        )
-        await session.execute(
-            text("SELECT set_config('app.current_organization_id', '', true);")
         )
     else:
         # SQLite verification tracking
@@ -357,12 +366,12 @@ async def set_tenant_context(
     session_is_sqlite = _is_sqlite_session(session)
     if not session_is_sqlite and session.in_transaction():
         await session.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true);"),
-            {"uid": uid_str}
-        )
-        await session.execute(
-            text("SELECT set_config('app.current_organization_id', :org_id, true);"),
-            {"org_id": str(org_uuid)}
+            text("""
+                SELECT
+                    set_config('app.current_user_id', :uid, true),
+                    set_config('app.current_organization_id', :org_id, true);
+            """),
+            {"uid": uid_str, "org_id": str(org_uuid)}
         )
     elif session_is_sqlite:
         session.info["last_applied_org_id"] = str(org_uuid)
